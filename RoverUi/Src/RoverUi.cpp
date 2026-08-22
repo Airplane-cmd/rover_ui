@@ -1066,6 +1066,10 @@ int main() {
     // v0.2: PanelManager owns per-panel swapchains, replaces the v0.1 hardcoded QuadSwapChain
     static rover::PanelManager panelMgr;
     panelMgr.Init(app.Session, app.HeadSpace, app.LocalSpace);
+    static rover::RayCursor cursor;
+    cursor.Init(app.Session);
+    static rover::RayLine rayLine;
+    rayLine.Init(app.Session);
     {
         // Center panel: 0DoF (head-locked). Blue-ish. 40x30 cm at 1.5 m ahead.
         XrPosef pose0 = {{0,0,0,1}, {0.0f, 0.0f, -1.5f}};
@@ -1517,7 +1521,7 @@ int main() {
 
         // v0.2: Meta sample projection layer stripped — we render only panels + passthrough now.
         // app.Layers[app.LayerCount++].Projection = proj_layer;
-        // v0.2: query head pose in local space (used for YawLocked panels), then build all panels
+        // v0.2: head pose in local space (used for BodyLocked/YawLocked)
         XrPosef headInLocal = {{0,0,0,1}, {0,0,0}};
         {
             XrSpaceLocation loc = {XR_TYPE_SPACE_LOCATION};
@@ -1528,12 +1532,120 @@ int main() {
                 }
             }
         }
+
+        // v0.3: right controller pose in local space + trigger + grab state machine
+        static int grabbedIdx = -1;
+        static XrPosef grabDelta = {{0,0,0,1}, {0,0,0}};
+        static bool prevTriggerDown = false;
+
+        XrPosef rightCtrl = {{0,0,0,1}, {0,0,0}};
+        bool rightCtrlValid = false;
+        if (rightControllerActive) {
+            XrSpaceLocation cloc = {XR_TYPE_SPACE_LOCATION};
+            if (xrLocateSpace(rightControllerAimSpace, app.LocalSpace, frameState.predictedDisplayTime, &cloc) == XR_SUCCESS) {
+                if ((cloc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
+                    (cloc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+                    rightCtrl = cloc.pose;
+                    rightCtrlValid = true;
+                }
+            }
+        }
+        bool triggerDown = (boolState.type != 0 && boolState.currentState != XR_FALSE);
+
+        rover::HitResult hit = {-1, false, 0};
+        if (rightCtrlValid) {
+            XrVector3f rayOrigin = rightCtrl.position;
+            const XrQuaternionf& q = rightCtrl.orientation;
+            float xx=q.x*q.x, yy=q.y*q.y;
+            float wx=q.w*q.x, wy=q.w*q.y;
+            float xz=q.x*q.z, yz=q.y*q.z;
+            XrVector3f rayDir;
+            rayDir.x = -(2*xz + 2*wy);
+            rayDir.y = -(2*yz - 2*wx);
+            rayDir.z = -(1 - 2*xx - 2*yy);
+            hit = panelMgr.Raycast(rayOrigin, rayDir, headInLocal);
+        }
+
+        if (grabbedIdx == -1) {
+            panelMgr.SetHovered(hit.panelIdx);
+            bool triggerPressed = triggerDown && !prevTriggerDown;
+            if (triggerPressed && hit.panelIdx >= 0 && rightCtrlValid) {  // v0.3.1: any panel hit, not just bar
+                grabbedIdx = hit.panelIdx;
+                XrPosef panelWorld = panelMgr.ResolveWorldPose(grabbedIdx, headInLocal);
+                grabDelta.position.x = panelWorld.position.x - rightCtrl.position.x;
+                grabDelta.position.y = panelWorld.position.y - rightCtrl.position.y;
+                grabDelta.position.z = panelWorld.position.z - rightCtrl.position.z;
+                grabDelta.orientation = panelWorld.orientation;
+            }
+        } else {
+            XrPosef liveWorld;
+            liveWorld.position.x = rightCtrl.position.x + grabDelta.position.x;
+            liveWorld.position.y = rightCtrl.position.y + grabDelta.position.y;
+            liveWorld.position.z = rightCtrl.position.z + grabDelta.position.z;
+            liveWorld.orientation = grabDelta.orientation;
+            panelMgr.CommitWorldPose(grabbedIdx, liveWorld, headInLocal);
+            if (!triggerDown || !rightCtrlValid) {
+                grabbedIdx = -1;
+                panelMgr.SetHovered(-1);
+            } else {
+                panelMgr.SetHovered(grabbedIdx);
+            }
+        }
+        prevTriggerDown = triggerDown;
+
+        // v0.3.1: cursor visible on hit, red when trigger down
+        if (hit.panelIdx >= 0 && rightCtrlValid) {
+            cursor.SetVisible(true);
+            cursor.SetActive(triggerDown);
+        } else {
+            cursor.SetVisible(false);
+        }
+        XrVector3f cursorPos = {0,0,0};
+        if (hit.panelIdx >= 0 && rightCtrlValid) {
+            cursorPos.x = rightCtrl.position.x + hit.distance * (
+                -(2*rightCtrl.orientation.x*rightCtrl.orientation.z + 2*rightCtrl.orientation.w*rightCtrl.orientation.y)
+            );
+            cursorPos.y = rightCtrl.position.y + hit.distance * (
+                -(2*rightCtrl.orientation.y*rightCtrl.orientation.z - 2*rightCtrl.orientation.w*rightCtrl.orientation.x)
+            );
+            cursorPos.z = rightCtrl.position.z + hit.distance * (
+                -(1 - 2*rightCtrl.orientation.x*rightCtrl.orientation.x - 2*rightCtrl.orientation.y*rightCtrl.orientation.y)
+            );
+        }
+
+        // v0.3.1: ray line visible whenever right controller is tracked; amber when trigger down
+        rayLine.SetVisible(false);  // v0.3.3: disabled pending better math
+        rayLine.SetActive(triggerDown);
+        XrVector3f rayDirWorld = {0, 0, -1};
+        if (rightCtrlValid) {
+            const XrQuaternionf& qq = rightCtrl.orientation;
+            float xx=qq.x*qq.x, yy=qq.y*qq.y;
+            float wx=qq.w*qq.x, wy=qq.w*qq.y;
+            float xz=qq.x*qq.z, yz=qq.y*qq.z;
+            rayDirWorld.x = -(2*xz + 2*wy);
+            rayDirWorld.y = -(2*yz - 2*wx);
+            rayDirWorld.z = -(1 - 2*xx - 2*yy);
+        }
+        float rayLen = (hit.panelIdx >= 0) ? hit.distance : 3.0f;
+
         {
             XrCompositionLayerQuad panelQuads[MaxLayerCount];
             int panelCount = 0;
             panelMgr.BuildLayers(panelQuads, MaxLayerCount, &panelCount, headInLocal);
             for (int i = 0; i < panelCount && app.LayerCount < MaxLayerCount; i++) {
                 app.Layers[app.LayerCount++].Quad = panelQuads[i];
+            }
+            // cursor last so it renders on top
+            XrCompositionLayerQuad cursorLayer;
+            if (cursor.BuildLayer(&cursorLayer, app.LocalSpace, cursorPos, headInLocal)
+                && app.LayerCount < MaxLayerCount) {
+                app.Layers[app.LayerCount++].Quad = cursorLayer;
+            }
+            XrCompositionLayerQuad rayLayer;
+            if (rightCtrlValid && rayLine.BuildLayer(&rayLayer, app.LocalSpace,
+                    rightCtrl.position, rayDirWorld, rayLen, headInLocal)
+                && app.LayerCount < MaxLayerCount) {
+                app.Layers[app.LayerCount++].Quad = rayLayer;
             }
         }
 
@@ -1553,6 +1665,8 @@ int main() {
         OXR(xrEndFrame(app.Session, &endFrameInfo));
     }
 
+    rayLine.Shutdown();
+    cursor.Shutdown();
     panelMgr.Shutdown();
     app.appRenderer.Destroy();
 
