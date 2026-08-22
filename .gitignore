@@ -1,0 +1,21 @@
+# Android build outputs
+*.iml
+.gradle/
+build/
+local.properties
+.idea/
+*.apk
+*.aab
+
+# NDK / CMake
+.cxx/
+*.o
+*.a
+*.so
+
+# Meta OpenXR SDK (fetched by setup.sh, not committed)
+meta-openxr-sdk/
+
+# Editor
+.vscode/
+.DS_Store
