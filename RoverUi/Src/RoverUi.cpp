@@ -48,6 +48,7 @@ Authors   :
 #include <assert.h>
 
 #include "RoverUi.h"
+#include "Panel.h"
 #include "RoverUiInput.h"
 #include "RoverUiGl.h"
 
@@ -1062,37 +1063,22 @@ int main() {
     delete[] colorTextures;
 
     AppInput_init(app);
-    // v0.1: create head-locked quad swapchain (256x256, one solid-color image) — rover_ui
+    // v0.2: PanelManager owns per-panel swapchains, replaces the v0.1 hardcoded QuadSwapChain
+    static rover::PanelManager panelMgr;
+    panelMgr.Init(app.Session, app.HeadSpace, app.LocalSpace);
     {
-        XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
-        ci.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
-        ci.format = GL_SRGB8_ALPHA8;
-        ci.sampleCount = 1;
-        ci.width = 256; ci.height = 256;
-        ci.faceCount = 1; ci.arraySize = 1; ci.mipCount = 1;
-        OXR(xrCreateSwapchain(app.Session, &ci, &app.QuadSwapChain));
-        uint32_t qLen = 0;
-        OXR(xrEnumerateSwapchainImages(app.QuadSwapChain, 0, &qLen, nullptr));
-        auto qImgs = new XrSwapchainImageOpenGLESKHR[qLen];
-        for (uint32_t i = 0; i < qLen; i++) qImgs[i] = {XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR};
-        OXR(xrEnumerateSwapchainImages(app.QuadSwapChain, qLen, &qLen, (XrSwapchainImageBaseHeader*)qImgs));
-        uint32_t qIdx = 0;
-        XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-        OXR(xrAcquireSwapchainImage(app.QuadSwapChain, &ai, &qIdx));
-        XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-        wi.timeout = XR_INFINITE_DURATION;
-        OXR(xrWaitSwapchainImage(app.QuadSwapChain, &wi));
-        GLuint fbo = 0;
-        glGenFramebuffers(1, &fbo);
-        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, (GLuint)qImgs[qIdx].image, 0);
-        glClearColor(0.15f, 0.35f, 0.60f, 0.85f);
-        glClear(GL_COLOR_BUFFER_BIT);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glDeleteFramebuffers(1, &fbo);
-        XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        OXR(xrReleaseSwapchainImage(app.QuadSwapChain, &ri));
-        delete[] qImgs;
+        // Center panel: 0DoF (head-locked). Blue-ish. 40x30 cm at 1.5 m ahead.
+        XrPosef pose0 = {{0,0,0,1}, {0.0f, 0.0f, -1.5f}};
+        panelMgr.AddPanel(rover::DofMode::HeadLocked, pose0, {0.40f, 0.30f}, 0.15f, 0.35f, 0.60f, 0.85f);
+
+        // Left panel: 6DoF (world-anchored). Green. 40x30 cm at 1.5 m ahead + 0.6 m left.
+        XrPosef pose1 = {{0,0,0,1}, {-0.6f, 0.0f, -1.5f}};
+        panelMgr.AddPanel(rover::DofMode::WorldAnchored, pose1, {0.40f, 0.30f}, 0.20f, 0.55f, 0.25f, 0.85f);
+
+        // Right panel: 3DoF (yaw-locked, rotates with head yaw but stays put on pitch/roll/translation-drift).
+        // Red. Pose is offset from head-yaw origin: 0.6 m right, 1.5 m ahead.
+        XrPosef pose2 = {{0,0,0,1}, {0.6f, 0.0f, -1.5f}};
+        panelMgr.AddPanel(rover::DofMode::BodyLocked, pose2, {0.40f, 0.30f}, 0.65f, 0.25f, 0.25f, 0.85f);
     }
 
 
@@ -1529,21 +1515,26 @@ int main() {
             proj_view.subImage.imageArrayIndex = eye;
         }
 
-        app.Layers[app.LayerCount++].Projection = proj_layer;
-        // v0.1: head-locked quad layer — rover_ui
+        // v0.2: Meta sample projection layer stripped — we render only panels + passthrough now.
+        // app.Layers[app.LayerCount++].Projection = proj_layer;
+        // v0.2: query head pose in local space (used for YawLocked panels), then build all panels
+        XrPosef headInLocal = {{0,0,0,1}, {0,0,0}};
         {
-            XrCompositionLayerQuad quad = {XR_TYPE_COMPOSITION_LAYER_QUAD};
-            quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-            quad.space = app.HeadSpace;
-            quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-            quad.subImage.swapchain = app.QuadSwapChain;
-            quad.subImage.imageRect.offset = {0, 0};
-            quad.subImage.imageRect.extent = {256, 256};
-            quad.subImage.imageArrayIndex = 0;
-            quad.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
-            quad.pose.position = {0.0f, 0.0f, -1.5f};
-            quad.size = {0.6f, 0.6f};
-            app.Layers[app.LayerCount++].Quad = quad;
+            XrSpaceLocation loc = {XR_TYPE_SPACE_LOCATION};
+            if (xrLocateSpace(app.HeadSpace, app.LocalSpace, frameState.predictedDisplayTime, &loc) == XR_SUCCESS) {
+                if ((loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
+                    (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+                    headInLocal = loc.pose;
+                }
+            }
+        }
+        {
+            XrCompositionLayerQuad panelQuads[MaxLayerCount];
+            int panelCount = 0;
+            panelMgr.BuildLayers(panelQuads, MaxLayerCount, &panelCount, headInLocal);
+            for (int i = 0; i < panelCount && app.LayerCount < MaxLayerCount; i++) {
+                app.Layers[app.LayerCount++].Quad = panelQuads[i];
+            }
         }
 
 
@@ -1562,6 +1553,7 @@ int main() {
         OXR(xrEndFrame(app.Session, &endFrameInfo));
     }
 
+    panelMgr.Shutdown();
     app.appRenderer.Destroy();
 
     AppInput_shutdown();
