@@ -155,6 +155,11 @@ XrPath rightHandPath = XR_NULL_PATH;
 } // namespace
 
 XrActionStateBoolean boolState;
+XrActionStateBoolean leftTriggerState;
+XrActionStateBoolean rightTriggerState;
+XrActionStateVector2f leftThumbState;
+XrActionStateVector2f rightThumbState;
+static XrAction thumbstickAction = XR_NULL_HANDLE;
 
 bool leftControllerActive = false;
 bool rightControllerActive = false;
@@ -168,7 +173,8 @@ void AppInput_init(App& app) {
     // Actions
     runningActionSet =
         CreateActionSet(app.Instance, 1, "running_action_set", "Action Set used on main loop");
-    boolAction = CreateAction(runningActionSet, XR_ACTION_TYPE_BOOLEAN_INPUT, "toggle", "Toggle");
+        // v0.3.13: boolAction moved below (needs handSubactionPaths for per-hand queries)
+
 
     OXR(xrStringToPath(app.Instance, "/user/hand/left", &leftHandPath));
     OXR(xrStringToPath(app.Instance, "/user/hand/right", &rightHandPath));
@@ -176,6 +182,12 @@ void AppInput_init(App& app) {
 
     aimPoseAction = CreateAction(
         runningActionSet, XR_ACTION_TYPE_POSE_INPUT, "aim_pose", nullptr, 2, handSubactionPaths);
+
+    boolAction = CreateAction(
+        runningActionSet, XR_ACTION_TYPE_BOOLEAN_INPUT, "toggle", "Toggle", 2, handSubactionPaths);
+
+    thumbstickAction = CreateAction(
+        runningActionSet, XR_ACTION_TYPE_VECTOR2F_INPUT, "thumbstick", nullptr, 2, handSubactionPaths);
 
     gripPoseAction = CreateAction(
         runningActionSet, XR_ACTION_TYPE_POSE_INPUT, "grip_pose", nullptr, 2, handSubactionPaths);
@@ -202,6 +214,10 @@ void AppInput_init(App& app) {
             ActionSuggestedBinding(app, gripPoseAction, "/user/hand/left/input/grip/pose"));
         bindings.push_back(
             ActionSuggestedBinding(app, gripPoseAction, "/user/hand/right/input/grip/pose"));
+        bindings.push_back(
+            ActionSuggestedBinding(app, thumbstickAction, "/user/hand/left/input/thumbstick"));
+        bindings.push_back(
+            ActionSuggestedBinding(app, thumbstickAction, "/user/hand/right/input/thumbstick"));
 
         XrInteractionProfileSuggestedBinding suggestedBindings = {
             XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
@@ -257,4 +273,23 @@ void AppInput_syncActions(App& app) {
 
     leftControllerActive = ActionPoseIsActive(app, aimPoseAction, leftHandPath);
     rightControllerActive = ActionPoseIsActive(app, aimPoseAction, rightHandPath);
+
+    // v0.3.13: per-hand trigger + thumbstick state
+    {
+        XrActionStateGetInfo gi = {XR_TYPE_ACTION_STATE_GET_INFO};
+        gi.action = boolAction;
+        gi.subactionPath = leftHandPath;
+        leftTriggerState = {XR_TYPE_ACTION_STATE_BOOLEAN};
+        OXR(xrGetActionStateBoolean(app.Session, &gi, &leftTriggerState));
+        gi.subactionPath = rightHandPath;
+        rightTriggerState = {XR_TYPE_ACTION_STATE_BOOLEAN};
+        OXR(xrGetActionStateBoolean(app.Session, &gi, &rightTriggerState));
+        gi.action = thumbstickAction;
+        gi.subactionPath = leftHandPath;
+        leftThumbState = {XR_TYPE_ACTION_STATE_VECTOR2F};
+        OXR(xrGetActionStateVector2f(app.Session, &gi, &leftThumbState));
+        gi.subactionPath = rightHandPath;
+        rightThumbState = {XR_TYPE_ACTION_STATE_VECTOR2F};
+        OXR(xrGetActionStateVector2f(app.Session, &gi, &rightThumbState));
+    }
 }

@@ -499,24 +499,16 @@ bool RayLine::BuildLayer(XrCompositionLayerQuad* out, XrSpace localSpace,
     if (nLen < 1e-4f) return false;
     n.x /= nLen; n.y /= nLen; n.z /= nLen;
 
-    // right = n × rd  (so that rt × rd = -n, making [rt|rd|-n] a proper right-handed rotation)
-    XrVector3f rt = {
-        n.y * rd.z - n.z * rd.y,
-        n.z * rd.x - n.x * rd.z,
-        n.x * rd.y - n.y * rd.x,
-    };
 
-    // Quad's frame axes: forward = -n (quad faces the head), up = rd, right = -rt (chirality)
-    // Convert to quaternion via 3x3 matrix -> quat.
-    // Columns: rt, rd, -n (right, up, back). We want quat that rotates world axes to these.
-    // Rotation matrix R where R * (1,0,0) = right (rt), R * (0,1,0) = up (rd), R * (0,0,1) = -n
-    // Wait: OpenXR quad face is -Z in its local space. We want -Z = -n → +Z = n.
-    // Rebuild: matrix columns are new-basis expressed in world: [right, up, forward_out]
-    // where forward_out is what "+Z of quad local" points to. Since quad face is -Z, we want +Z to point AWAY from head. That's -n (opposite of m2h projection).
-    // So: R = [ rt | rd | -n ]
-    float m00 = rt.x, m01 = rd.x, m02 = -n.x;
-    float m10 = rt.y, m11 = rd.y, m12 = -n.y;
-    float m20 = rt.z, m21 = rd.z, m22 = -n.z;
+    // OpenXR quad face normal is +Z. We want +Z to point TOWARD head (= +n direction, since n is m2h projected).
+    // Matrix R with columns [right, up, +Z]: R * (0,0,1) = column 2 = +n (points to head).
+    // We need rt × rd = +n for right-handed frame. Our rt = n × rd gives rt × rd = -n. So swap to right = rd × n.
+    XrVector3f rtc = { rd.y * n.z - rd.z * n.y,
+                        rd.z * n.x - rd.x * n.z,
+                        rd.x * n.y - rd.y * n.x };
+    float m00 = rtc.x, m01 = rd.x, m02 = n.x;
+    float m10 = rtc.y, m11 = rd.y, m12 = n.y;
+    float m20 = rtc.z, m21 = rd.z, m22 = n.z;
 
     // Standard matrix-to-quaternion
     float tr = m00 + m11 + m22;

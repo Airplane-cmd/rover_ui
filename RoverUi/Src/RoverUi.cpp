@@ -1066,10 +1066,14 @@ int main() {
     // v0.2: PanelManager owns per-panel swapchains, replaces the v0.1 hardcoded QuadSwapChain
     static rover::PanelManager panelMgr;
     panelMgr.Init(app.Session, app.HeadSpace, app.LocalSpace);
-    static rover::RayCursor cursor;
+    static rover::RayCursor cursor;      // right
     cursor.Init(app.Session);
-    static rover::RayLine rayLine;
+    static rover::RayLine rayLine;       // right
     rayLine.Init(app.Session);
+    static rover::RayCursor leftCursor;
+    leftCursor.Init(app.Session);
+    static rover::RayLine leftRayLine;
+    leftRayLine.Init(app.Session);
     {
         // Center panel: 0DoF (head-locked). Blue-ish. 40x30 cm at 1.5 m ahead.
         XrPosef pose0 = {{0,0,0,1}, {0.0f, 0.0f, -1.5f}};
@@ -1299,13 +1303,11 @@ int main() {
             }
         }
 
-        // FB_passthrough sample begin
-        // Cycle through passthrough operation / display modes
-        const Mode prevMode = Mode(
-            ((frameCount - framesCyclePaused + (framesPerMode * Mode_NumModes) - 1) /
-             framesPerMode) %
-            Mode_NumModes);
-        const Mode mode = Mode(((frameCount - framesCyclePaused) / framesPerMode) % Mode_NumModes);
+        // v0.3.15: passthrough locked to Basic (no style cycling)
+        static bool passthroughInitDone = false;
+        const Mode prevMode = passthroughInitDone ? Mode_Passthrough_Basic : Mode_Passthrough_Stopped;
+        const Mode mode = Mode_Passthrough_Basic;
+        passthroughInitDone = true;
 
         if (mode != prevMode) {
             // Unset any sticky state from the previous mode
@@ -1337,7 +1339,7 @@ int main() {
                 case Mode_Passthrough_Basic:
                     passthroughLayer = reconPassthroughLayer;
                     OXR(xrPassthroughLayerResumeFB(passthroughLayer));
-                    style.textureOpacityFactor = 0.5f;
+                    style.textureOpacityFactor = 1.0f;
                     style.edgeColor = {0.0f, 0.0f, 0.0f, 0.0f};
                     OXR(xrPassthroughLayerSetStyleFB(passthroughLayer, &style));
                     break;
@@ -1533,100 +1535,189 @@ int main() {
             }
         }
 
-        // v0.3: right controller pose in local space + trigger + grab state machine
+        // v0.3.13: both controllers, per-hand triggers, thumbstick for distance
         static int grabbedIdx = -1;
-        static XrPosef grabDelta = {{0,0,0,1}, {0,0,0}};
-        static bool prevTriggerDown = false;
+        static int grabbedHand = 0;   // 0 = none, 1 = left, 2 = right
+        static float grabDist = 1.5f;
+        static XrVector3f grabOffsetWorld = {0,0,0};
+        static XrQuaternionf grabOrient = {0,0,0,1};
+        static bool prevLeftTrigger = false;
+        static bool prevRightTrigger = false;
 
-        XrPosef rightCtrl = {{0,0,0,1}, {0,0,0}};
-        bool rightCtrlValid = false;
-        if (rightControllerActive) {
-            XrSpaceLocation cloc = {XR_TYPE_SPACE_LOCATION};
-            if (xrLocateSpace(rightControllerAimSpace, app.LocalSpace, frameState.predictedDisplayTime, &cloc) == XR_SUCCESS) {
-                if ((cloc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
-                    (cloc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
-                    rightCtrl = cloc.pose;
-                    rightCtrlValid = true;
+        auto locateCtrl = [&](XrSpace space, bool active, XrPosef* outPose, bool* outValid) {
+            *outValid = false;
+            if (!active) return;
+            XrSpaceLocation loc = {XR_TYPE_SPACE_LOCATION};
+            if (xrLocateSpace(space, app.LocalSpace, frameState.predictedDisplayTime, &loc) == XR_SUCCESS) {
+                if ((loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
+                    (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+                    *outPose = loc.pose;
+                    *outValid = true;
                 }
             }
-        }
-        bool triggerDown = (boolState.type != 0 && boolState.currentState != XR_FALSE);
+        };
+        XrPosef leftCtrl = {{0,0,0,1}, {0,0,0}}, rightCtrl = {{0,0,0,1}, {0,0,0}};
+        bool leftCtrlValid = false, rightCtrlValid = false;
+        locateCtrl(leftControllerAimSpace, leftControllerActive, &leftCtrl, &leftCtrlValid);
+        locateCtrl(rightControllerAimSpace, rightControllerActive, &rightCtrl, &rightCtrlValid);
 
-        rover::HitResult hit = {-1, false, 0};
-        if (rightCtrlValid) {
-            XrVector3f rayOrigin = rightCtrl.position;
-            const XrQuaternionf& q = rightCtrl.orientation;
+        bool leftTrigger = (leftTriggerState.type != 0 && leftTriggerState.currentState != XR_FALSE);
+        bool rightTrigger = (rightTriggerState.type != 0 && rightTriggerState.currentState != XR_FALSE);
+        bool triggerDown = leftTrigger || rightTrigger;
+
+        auto computeRayDir = [](const XrQuaternionf& q) {
             float xx=q.x*q.x, yy=q.y*q.y;
             float wx=q.w*q.x, wy=q.w*q.y;
             float xz=q.x*q.z, yz=q.y*q.z;
-            XrVector3f rayDir;
-            rayDir.x = -(2*xz + 2*wy);
-            rayDir.y = -(2*yz - 2*wx);
-            rayDir.z = -(1 - 2*xx - 2*yy);
-            hit = panelMgr.Raycast(rayOrigin, rayDir, headInLocal);
-        }
+            XrVector3f r;
+            r.x = -(2*xz + 2*wy);
+            r.y = -(2*yz - 2*wx);
+            r.z = -(1 - 2*xx - 2*yy);
+            return r;
+        };
+        rover::HitResult rightHit = {-1, false, 0}, leftHit = {-1, false, 0};
+        if (rightCtrlValid) rightHit = panelMgr.Raycast(rightCtrl.position, computeRayDir(rightCtrl.orientation), headInLocal);
+        if (leftCtrlValid)  leftHit  = panelMgr.Raycast(leftCtrl.position,  computeRayDir(leftCtrl.orientation),  headInLocal);
+        // For legacy cursor path: use grabbing hand hit if grabbing, else right, else left
+        rover::HitResult hit = rightHit;
+        if (grabbedHand == 1) hit = leftHit;
+        else if (!rightCtrlValid && leftCtrlValid) hit = leftHit;
 
         if (grabbedIdx == -1) {
-            panelMgr.SetHovered(hit.panelIdx);
-            bool triggerPressed = triggerDown && !prevTriggerDown;
-            if (triggerPressed && hit.panelIdx >= 0 && rightCtrlValid) {  // v0.3.1: any panel hit, not just bar
-                grabbedIdx = hit.panelIdx;
+            int hoverIdx = rightHit.panelIdx >= 0 ? rightHit.panelIdx : leftHit.panelIdx;
+            panelMgr.SetHovered(hoverIdx);
+
+            bool leftPressed  = leftTrigger  && !prevLeftTrigger;
+            bool rightPressed = rightTrigger && !prevRightTrigger;
+            int hand = 0;
+            rover::HitResult useHit = {-1, false, 0};
+            XrPosef useCtrl = {{0,0,0,1}, {0,0,0}};
+            if (rightPressed && rightHit.panelIdx >= 0 && rightCtrlValid) {
+                hand = 2; useHit = rightHit; useCtrl = rightCtrl;
+            } else if (leftPressed && leftHit.panelIdx >= 0 && leftCtrlValid) {
+                hand = 1; useHit = leftHit; useCtrl = leftCtrl;
+            }
+            if (hand != 0) {
+                grabbedIdx = useHit.panelIdx;
+                grabbedHand = hand;
                 XrPosef panelWorld = panelMgr.ResolveWorldPose(grabbedIdx, headInLocal);
-                grabDelta.position.x = panelWorld.position.x - rightCtrl.position.x;
-                grabDelta.position.y = panelWorld.position.y - rightCtrl.position.y;
-                grabDelta.position.z = panelWorld.position.z - rightCtrl.position.z;
-                grabDelta.orientation = panelWorld.orientation;
+                grabDist = useHit.distance;
+                if (grabDist < 0.2f) grabDist = 0.2f;
+                XrVector3f rd = computeRayDir(useCtrl.orientation);
+                XrVector3f grabPoint = {
+                    useCtrl.position.x + grabDist * rd.x,
+                    useCtrl.position.y + grabDist * rd.y,
+                    useCtrl.position.z + grabDist * rd.z,
+                };
+                grabOffsetWorld.x = panelWorld.position.x - grabPoint.x;
+                grabOffsetWorld.y = panelWorld.position.y - grabPoint.y;
+                grabOffsetWorld.z = panelWorld.position.z - grabPoint.z;
+                grabOrient = panelWorld.orientation;
             }
         } else {
+            bool grabTrigger = (grabbedHand == 1) ? leftTrigger : rightTrigger;
+            bool grabValid   = (grabbedHand == 1) ? leftCtrlValid : rightCtrlValid;
+            XrPosef grabCtrl = (grabbedHand == 1) ? leftCtrl : rightCtrl;
+            float thumbY = (grabbedHand == 1) ? leftThumbState.currentState.y : rightThumbState.currentState.y;
+            const float THUMB_DEAD = 0.15f;
+            const float THUMB_SPEED = 1.0f;   // meters/sec at full deflection, per-frame scale of ~1/90Hz
+            if (thumbY > THUMB_DEAD) grabDist += (thumbY - THUMB_DEAD) * (1.0f / (1.0f - THUMB_DEAD)) * THUMB_SPEED / 90.0f;
+            else if (thumbY < -THUMB_DEAD) grabDist += (thumbY + THUMB_DEAD) * (1.0f / (1.0f - THUMB_DEAD)) * THUMB_SPEED / 90.0f;
+            if (grabDist < 0.2f) grabDist = 0.2f;
+            if (grabDist > 10.0f) grabDist = 10.0f;
+
+            XrVector3f rd = computeRayDir(grabCtrl.orientation);
             XrPosef liveWorld;
-            liveWorld.position.x = rightCtrl.position.x + grabDelta.position.x;
-            liveWorld.position.y = rightCtrl.position.y + grabDelta.position.y;
-            liveWorld.position.z = rightCtrl.position.z + grabDelta.position.z;
-            liveWorld.orientation = grabDelta.orientation;
+            liveWorld.position.x = grabCtrl.position.x + grabDist * rd.x + grabOffsetWorld.x;
+            liveWorld.position.y = grabCtrl.position.y + grabDist * rd.y + grabOffsetWorld.y;
+            liveWorld.position.z = grabCtrl.position.z + grabDist * rd.z + grabOffsetWorld.z;
+            // Auto-face head: panel +Z aims at head, world up locked to avoid roll
+            {
+                float tx = headInLocal.position.x - liveWorld.position.x;
+                float ty = headInLocal.position.y - liveWorld.position.y;
+                float tz = headInLocal.position.z - liveWorld.position.z;
+                float tlen = std::sqrt(tx*tx + ty*ty + tz*tz);
+                if (tlen > 1e-4f) {
+                    tx /= tlen; ty /= tlen; tz /= tlen;
+                    // right = world_up × toUser
+                    float rx = 1.0f * tz - 0.0f * ty;
+                    float ry = 0.0f * tx - 0.0f * tz;
+                    float rz = 0.0f * ty - 1.0f * tx;
+                    float rlen = std::sqrt(rx*rx + ry*ry + rz*rz);
+                    if (rlen > 1e-4f) {
+                        rx /= rlen; ry /= rlen; rz /= rlen;
+                        // up = toUser × right
+                        float ux = ty * rz - tz * ry;
+                        float uy = tz * rx - tx * rz;
+                        float uz = tx * ry - ty * rx;
+                        // Rotation matrix columns: [right, up, toUser]
+                        // matrix-to-quat
+                        float m00=rx, m01=ux, m02=tx;
+                        float m10=ry, m11=uy, m12=ty;
+                        float m20=rz, m21=uz, m22=tz;
+                        float tr = m00 + m11 + m22;
+                        XrQuaternionf q;
+                        if (tr > 0.0f) {
+                            float S = std::sqrt(tr + 1.0f) * 2.0f;
+                            q.w = 0.25f * S; q.x = (m21 - m12)/S; q.y = (m02 - m20)/S; q.z = (m10 - m01)/S;
+                        } else if (m00 > m11 && m00 > m22) {
+                            float S = std::sqrt(1.0f + m00 - m11 - m22) * 2.0f;
+                            q.w = (m21 - m12)/S; q.x = 0.25f*S; q.y = (m01 + m10)/S; q.z = (m02 + m20)/S;
+                        } else if (m11 > m22) {
+                            float S = std::sqrt(1.0f + m11 - m00 - m22) * 2.0f;
+                            q.w = (m02 - m20)/S; q.x = (m01 + m10)/S; q.y = 0.25f*S; q.z = (m12 + m21)/S;
+                        } else {
+                            float S = std::sqrt(1.0f + m22 - m00 - m11) * 2.0f;
+                            q.w = (m10 - m01)/S; q.x = (m02 + m20)/S; q.y = (m12 + m21)/S; q.z = 0.25f*S;
+                        }
+                        liveWorld.orientation = q;
+                    } else {
+                        liveWorld.orientation = grabOrient;
+                    }
+                } else {
+                    liveWorld.orientation = grabOrient;
+                }
+            }
             panelMgr.CommitWorldPose(grabbedIdx, liveWorld, headInLocal);
-            if (!triggerDown || !rightCtrlValid) {
+            if (!grabTrigger || !grabValid) {
                 grabbedIdx = -1;
+                grabbedHand = 0;
                 panelMgr.SetHovered(-1);
             } else {
                 panelMgr.SetHovered(grabbedIdx);
             }
         }
-        prevTriggerDown = triggerDown;
+        prevLeftTrigger = leftTrigger;
+        prevRightTrigger = rightTrigger;
 
-        // v0.3.1: cursor visible on hit, red when trigger down
-        if (hit.panelIdx >= 0 && rightCtrlValid) {
-            cursor.SetVisible(true);
-            cursor.SetActive(triggerDown);
-        } else {
-            cursor.SetVisible(false);
+        // Cursor visibility per hand
+        cursor.SetVisible(rightHit.panelIdx >= 0 && rightCtrlValid);
+        cursor.SetActive(rightTrigger);
+        leftCursor.SetVisible(leftHit.panelIdx >= 0 && leftCtrlValid);
+        leftCursor.SetActive(leftTrigger);
+        XrVector3f rightCursorPos = {0,0,0}, leftCursorPos = {0,0,0};
+        if (rightHit.panelIdx >= 0 && rightCtrlValid) {
+            XrVector3f rd = computeRayDir(rightCtrl.orientation);
+            rightCursorPos.x = rightCtrl.position.x + rightHit.distance * rd.x;
+            rightCursorPos.y = rightCtrl.position.y + rightHit.distance * rd.y;
+            rightCursorPos.z = rightCtrl.position.z + rightHit.distance * rd.z;
         }
-        XrVector3f cursorPos = {0,0,0};
-        if (hit.panelIdx >= 0 && rightCtrlValid) {
-            cursorPos.x = rightCtrl.position.x + hit.distance * (
-                -(2*rightCtrl.orientation.x*rightCtrl.orientation.z + 2*rightCtrl.orientation.w*rightCtrl.orientation.y)
-            );
-            cursorPos.y = rightCtrl.position.y + hit.distance * (
-                -(2*rightCtrl.orientation.y*rightCtrl.orientation.z - 2*rightCtrl.orientation.w*rightCtrl.orientation.x)
-            );
-            cursorPos.z = rightCtrl.position.z + hit.distance * (
-                -(1 - 2*rightCtrl.orientation.x*rightCtrl.orientation.x - 2*rightCtrl.orientation.y*rightCtrl.orientation.y)
-            );
+        if (leftHit.panelIdx >= 0 && leftCtrlValid) {
+            XrVector3f rd = computeRayDir(leftCtrl.orientation);
+            leftCursorPos.x = leftCtrl.position.x + leftHit.distance * rd.x;
+            leftCursorPos.y = leftCtrl.position.y + leftHit.distance * rd.y;
+            leftCursorPos.z = leftCtrl.position.z + leftHit.distance * rd.z;
         }
 
-        // v0.3.1: ray line visible whenever right controller is tracked; amber when trigger down
-        rayLine.SetVisible(false);  // v0.3.3: disabled pending better math
-        rayLine.SetActive(triggerDown);
-        XrVector3f rayDirWorld = {0, 0, -1};
-        if (rightCtrlValid) {
-            const XrQuaternionf& qq = rightCtrl.orientation;
-            float xx=qq.x*qq.x, yy=qq.y*qq.y;
-            float wx=qq.w*qq.x, wy=qq.w*qq.y;
-            float xz=qq.x*qq.z, yz=qq.y*qq.z;
-            rayDirWorld.x = -(2*xz + 2*wy);
-            rayDirWorld.y = -(2*yz - 2*wx);
-            rayDirWorld.z = -(1 - 2*xx - 2*yy);
-        }
-        float rayLen = (hit.panelIdx >= 0) ? hit.distance : 3.0f;
+        // Ray-line per hand
+        rayLine.SetVisible(rightCtrlValid);
+        rayLine.SetActive(rightTrigger);
+        leftRayLine.SetVisible(leftCtrlValid);
+        leftRayLine.SetActive(leftTrigger);
+        XrVector3f rightRayDir = rightCtrlValid ? computeRayDir(rightCtrl.orientation) : XrVector3f{0,0,-1};
+        XrVector3f leftRayDir  = leftCtrlValid  ? computeRayDir(leftCtrl.orientation)  : XrVector3f{0,0,-1};
+        float rightRayLen = (rightHit.panelIdx >= 0) ? rightHit.distance : 3.0f;
+        float leftRayLen  = (leftHit.panelIdx >= 0)  ? leftHit.distance  : 3.0f;
 
         {
             XrCompositionLayerQuad panelQuads[MaxLayerCount];
@@ -1635,17 +1726,28 @@ int main() {
             for (int i = 0; i < panelCount && app.LayerCount < MaxLayerCount; i++) {
                 app.Layers[app.LayerCount++].Quad = panelQuads[i];
             }
-            // cursor last so it renders on top
+            // Cursors + rays for both hands (last, so they render on top)
             XrCompositionLayerQuad cursorLayer;
-            if (cursor.BuildLayer(&cursorLayer, app.LocalSpace, cursorPos, headInLocal)
+            if (cursor.BuildLayer(&cursorLayer, app.LocalSpace, rightCursorPos, headInLocal)
                 && app.LayerCount < MaxLayerCount) {
                 app.Layers[app.LayerCount++].Quad = cursorLayer;
             }
+            XrCompositionLayerQuad leftCursorLayer;
+            if (leftCursor.BuildLayer(&leftCursorLayer, app.LocalSpace, leftCursorPos, headInLocal)
+                && app.LayerCount < MaxLayerCount) {
+                app.Layers[app.LayerCount++].Quad = leftCursorLayer;
+            }
             XrCompositionLayerQuad rayLayer;
             if (rightCtrlValid && rayLine.BuildLayer(&rayLayer, app.LocalSpace,
-                    rightCtrl.position, rayDirWorld, rayLen, headInLocal)
+                    rightCtrl.position, rightRayDir, rightRayLen, headInLocal)
                 && app.LayerCount < MaxLayerCount) {
                 app.Layers[app.LayerCount++].Quad = rayLayer;
+            }
+            XrCompositionLayerQuad leftRayLayer;
+            if (leftCtrlValid && leftRayLine.BuildLayer(&leftRayLayer, app.LocalSpace,
+                    leftCtrl.position, leftRayDir, leftRayLen, headInLocal)
+                && app.LayerCount < MaxLayerCount) {
+                app.Layers[app.LayerCount++].Quad = leftRayLayer;
             }
         }
 
@@ -1667,6 +1769,8 @@ int main() {
 
     rayLine.Shutdown();
     cursor.Shutdown();
+    leftRayLine.Shutdown();
+    leftCursor.Shutdown();
     panelMgr.Shutdown();
     app.appRenderer.Destroy();
 

@@ -50,3 +50,8 @@ extern XrSpace leftControllerAimSpace;
 extern XrSpace rightControllerAimSpace;
 extern XrSpace leftControllerGripSpace;
 extern XrSpace rightControllerGripSpace;
+
+extern XrActionStateBoolean leftTriggerState;
+extern XrActionStateBoolean rightTriggerState;
+extern XrActionStateVector2f leftThumbState;
+extern XrActionStateVector2f rightThumbState;
