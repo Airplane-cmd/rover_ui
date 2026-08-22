@@ -35,14 +35,14 @@ repositories {
 apply plugin: 'com.android.application'
 
 android {
-  compileSdk 32
+  compileSdk 33
   ndkVersion '27.0.12077973'
   namespace "com.gantrping.rover"
 
   defaultConfig {
     applicationId "com.gantrping.rover"
     minSdk 26
-    targetSdk 32
+    targetSdk 33
     versionCode 1
     versionName "1.0"
 
