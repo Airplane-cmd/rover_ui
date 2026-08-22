@@ -60,3 +60,28 @@ Our code (RoverUi/**): MIT. See [LICENSE](LICENSE).
 Meta's OpenXR SDK (fetched by setup.sh) remains under the Oculus SDK License Agreement:
 https://developer.oculus.com/licenses/oculussdk/
 
+
+## Companion: wake_fix.sh
+
+If you run rover_ui with Guardian killed (walkable / no boundary), pressing Quest's power button to sleep + waking will break vrshell UI (side-effect of the "sweet-spot" state). `scripts/wake_fix.sh` is a background daemon that auto-recovers.
+
+Install (once, on Quest):
+```bash
+adb push scripts/wake_fix.sh /data/local/tmp/wake_fix.sh
+# via Termux runner wrapper (see quest-termux-claude memory):
+adb shell "/data/local/tmp/quest_termux_run.sh cp /data/local/tmp/wake_fix.sh /data/data/com.termux/files/home/wake_fix.sh
+
+## Companion: wake_fix.sh
+
+If you run rover_ui with Guardian killed (walkable / no boundary), pressing Quest's power button to sleep + waking will break vrshell UI (side-effect of the "sweet-spot" state). `scripts/wake_fix.sh` is a background daemon that auto-recovers.
+
+Install (once, on Quest):
+
+    # push the script into Quest's temp
+    adb push scripts/wake_fix.sh /data/local/tmp/wake_fix.sh
+
+    # from adb-shell (root grants via Magisk pre-approved for termux uid),
+    # copy into Termux home and wire up Termux:Boot autostart
+    adb shell 'su 10159 -c "cp /data/local/tmp/wake_fix.sh ~/wake_fix.sh && chmod +x ~/wake_fix.sh && mkdir -p ~/.termux/boot && printf %s\n \"#!/data/data/com.termux/files/usr/bin/bash\" \"exec ~/wake_fix.sh\" > ~/.termux/boot/wake-fix && chmod +x ~/.termux/boot/wake-fix"'
+
+Then reboot Quest once. Termux:Boot APK required (from F-Droid).
