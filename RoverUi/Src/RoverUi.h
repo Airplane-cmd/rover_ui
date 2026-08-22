@@ -155,6 +155,8 @@ struct App {
     bool TouchPadDownLastFrame;
 
     XrSwapchain ColorSwapChain;
+    XrSwapchain QuadSwapChain;
+    GLuint QuadTexture;
     uint32_t SwapChainLength;
     OVR::Vector3f StageBounds;
     // Provided by XrPassthroughGl, which is not aware of VrApi or OpenXR

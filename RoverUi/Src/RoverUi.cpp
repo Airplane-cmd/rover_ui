@@ -1062,6 +1062,39 @@ int main() {
     delete[] colorTextures;
 
     AppInput_init(app);
+    // v0.1: create head-locked quad swapchain (256x256, one solid-color image) — rover_ui
+    {
+        XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+        ci.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+        ci.format = GL_SRGB8_ALPHA8;
+        ci.sampleCount = 1;
+        ci.width = 256; ci.height = 256;
+        ci.faceCount = 1; ci.arraySize = 1; ci.mipCount = 1;
+        OXR(xrCreateSwapchain(app.Session, &ci, &app.QuadSwapChain));
+        uint32_t qLen = 0;
+        OXR(xrEnumerateSwapchainImages(app.QuadSwapChain, 0, &qLen, nullptr));
+        auto qImgs = new XrSwapchainImageOpenGLESKHR[qLen];
+        for (uint32_t i = 0; i < qLen; i++) qImgs[i] = {XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR};
+        OXR(xrEnumerateSwapchainImages(app.QuadSwapChain, qLen, &qLen, (XrSwapchainImageBaseHeader*)qImgs));
+        uint32_t qIdx = 0;
+        XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+        OXR(xrAcquireSwapchainImage(app.QuadSwapChain, &ai, &qIdx));
+        XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+        wi.timeout = XR_INFINITE_DURATION;
+        OXR(xrWaitSwapchainImage(app.QuadSwapChain, &wi));
+        GLuint fbo = 0;
+        glGenFramebuffers(1, &fbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, (GLuint)qImgs[qIdx].image, 0);
+        glClearColor(0.15f, 0.35f, 0.60f, 0.85f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glDeleteFramebuffers(1, &fbo);
+        XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        OXR(xrReleaseSwapchainImage(app.QuadSwapChain, &ri));
+        delete[] qImgs;
+    }
+
 
     // FB_passthrough sample begin
     // Create passthrough objects
@@ -1497,6 +1530,22 @@ int main() {
         }
 
         app.Layers[app.LayerCount++].Projection = proj_layer;
+        // v0.1: head-locked quad layer — rover_ui
+        {
+            XrCompositionLayerQuad quad = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+            quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            quad.space = app.HeadSpace;
+            quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            quad.subImage.swapchain = app.QuadSwapChain;
+            quad.subImage.imageRect.offset = {0, 0};
+            quad.subImage.imageRect.extent = {256, 256};
+            quad.subImage.imageArrayIndex = 0;
+            quad.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+            quad.pose.position = {0.0f, 0.0f, -1.5f};
+            quad.size = {0.6f, 0.6f};
+            app.Layers[app.LayerCount++].Quad = quad;
+        }
+
 
         // Compose the layers for this frame.
         const XrCompositionLayerBaseHeader* layers[MaxLayerCount] = {};
