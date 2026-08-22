@@ -1537,10 +1537,14 @@ int main() {
 
         // v0.3.13: both controllers, per-hand triggers, thumbstick for distance
         static int grabbedIdx = -1;
-        static int grabbedHand = 0;   // 0 = none, 1 = left, 2 = right
+        static int grabbedHand = 0;
         static float grabDist = 1.5f;
         static XrVector3f grabOffsetWorld = {0,0,0};
         static XrQuaternionf grabOrient = {0,0,0,1};
+        static int resizedIdx = -1;
+        static int resizedHand = 0;
+        static float resizeInitDist = 1.0f;
+        static XrExtent2Df resizeInitSize = {0.4f, 0.3f};
         static bool prevLeftTrigger = false;
         static bool prevRightTrigger = false;
 
@@ -1575,7 +1579,7 @@ int main() {
             r.z = -(1 - 2*xx - 2*yy);
             return r;
         };
-        rover::HitResult rightHit = {-1, false, 0}, leftHit = {-1, false, 0};
+        rover::HitResult rightHit = {-1, false, -1, 0}, leftHit = {-1, false, -1, 0};
         if (rightCtrlValid) rightHit = panelMgr.Raycast(rightCtrl.position, computeRayDir(rightCtrl.orientation), headInLocal);
         if (leftCtrlValid)  leftHit  = panelMgr.Raycast(leftCtrl.position,  computeRayDir(leftCtrl.orientation),  headInLocal);
         // For legacy cursor path: use grabbing hand hit if grabbing, else right, else left
@@ -1583,14 +1587,49 @@ int main() {
         if (grabbedHand == 1) hit = leftHit;
         else if (!rightCtrlValid && leftCtrlValid) hit = leftHit;
 
-        if (grabbedIdx == -1) {
+        if (resizedIdx >= 0) {
+            // RESIZE update: scale panel by current-dist / init-dist
+            bool grabTrigger = (resizedHand == 1) ? leftTrigger : rightTrigger;
+            bool grabValid   = (resizedHand == 1) ? leftCtrlValid : rightCtrlValid;
+            XrPosef grabCtrl = (resizedHand == 1) ? leftCtrl : rightCtrl;
+            if (!grabTrigger || !grabValid) {
+                resizedIdx = -1;
+                resizedHand = 0;
+                panelMgr.SetHovered(-1);
+            } else {
+                XrVector3f rd = computeRayDir(grabCtrl.orientation);
+                XrPosef panelWorld = panelMgr.ResolveWorldPose(resizedIdx, headInLocal);
+                // Use same grabDist-along-ray as when starting; simplest: intersect ray with plane through panel center parallel to panel face
+                // For MVP: use fixed initial distance approximation via current controller-to-panel-center dist
+                float px = grabCtrl.position.x - panelWorld.position.x;
+                float py = grabCtrl.position.y - panelWorld.position.y;
+                float pz = grabCtrl.position.z - panelWorld.position.z;
+                float ctrl_to_center = std::sqrt(px*px + py*py + pz*pz);
+                // grab point ~ controller + ctrl_to_center * ray direction
+                float gpx = grabCtrl.position.x + ctrl_to_center * rd.x;
+                float gpy = grabCtrl.position.y + ctrl_to_center * rd.y;
+                float gpz = grabCtrl.position.z + ctrl_to_center * rd.z;
+                float ddx = gpx - panelWorld.position.x;
+                float ddy = gpy - panelWorld.position.y;
+                float ddz = gpz - panelWorld.position.z;
+                float cur = std::sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
+                float scale = cur / resizeInitDist;
+                if (scale < 0.2f) scale = 0.2f;
+                if (scale > 5.0f) scale = 5.0f;
+                panelMgr.PanelAt(resizedIdx).size.width  = resizeInitSize.width  * scale;
+                panelMgr.PanelAt(resizedIdx).size.height = resizeInitSize.height * scale;
+                panelMgr.SetHovered(resizedIdx);
+            }
+            prevLeftTrigger = leftTrigger;
+            prevRightTrigger = rightTrigger;
+        } else if (grabbedIdx == -1) {
             int hoverIdx = rightHit.panelIdx >= 0 ? rightHit.panelIdx : leftHit.panelIdx;
             panelMgr.SetHovered(hoverIdx);
 
             bool leftPressed  = leftTrigger  && !prevLeftTrigger;
             bool rightPressed = rightTrigger && !prevRightTrigger;
             int hand = 0;
-            rover::HitResult useHit = {-1, false, 0};
+            rover::HitResult useHit = {-1, false, -1, 0};
             XrPosef useCtrl = {{0,0,0,1}, {0,0,0}};
             if (rightPressed && rightHit.panelIdx >= 0 && rightCtrlValid) {
                 hand = 2; useHit = rightHit; useCtrl = rightCtrl;
@@ -1598,21 +1637,34 @@ int main() {
                 hand = 1; useHit = leftHit; useCtrl = leftCtrl;
             }
             if (hand != 0) {
-                grabbedIdx = useHit.panelIdx;
-                grabbedHand = hand;
-                XrPosef panelWorld = panelMgr.ResolveWorldPose(grabbedIdx, headInLocal);
-                grabDist = useHit.distance;
-                if (grabDist < 0.2f) grabDist = 0.2f;
+                XrPosef panelWorld = panelMgr.ResolveWorldPose(useHit.panelIdx, headInLocal);
                 XrVector3f rd = computeRayDir(useCtrl.orientation);
                 XrVector3f grabPoint = {
-                    useCtrl.position.x + grabDist * rd.x,
-                    useCtrl.position.y + grabDist * rd.y,
-                    useCtrl.position.z + grabDist * rd.z,
+                    useCtrl.position.x + useHit.distance * rd.x,
+                    useCtrl.position.y + useHit.distance * rd.y,
+                    useCtrl.position.z + useHit.distance * rd.z,
                 };
-                grabOffsetWorld.x = panelWorld.position.x - grabPoint.x;
-                grabOffsetWorld.y = panelWorld.position.y - grabPoint.y;
-                grabOffsetWorld.z = panelWorld.position.z - grabPoint.z;
-                grabOrient = panelWorld.orientation;
+                if (useHit.cornerIdx >= 0) {
+                    // Start RESIZE
+                    resizedIdx = useHit.panelIdx;
+                    resizedHand = hand;
+                    float dx = grabPoint.x - panelWorld.position.x;
+                    float dy = grabPoint.y - panelWorld.position.y;
+                    float dz = grabPoint.z - panelWorld.position.z;
+                    resizeInitDist = std::sqrt(dx*dx + dy*dy + dz*dz);
+                    if (resizeInitDist < 0.02f) resizeInitDist = 0.02f;
+                    resizeInitSize = panelMgr.PanelAt(useHit.panelIdx).size;
+                } else {
+                    // Start MOVE
+                    grabbedIdx = useHit.panelIdx;
+                    grabbedHand = hand;
+                    grabDist = useHit.distance;
+                    if (grabDist < 0.2f) grabDist = 0.2f;
+                    grabOffsetWorld.x = panelWorld.position.x - grabPoint.x;
+                    grabOffsetWorld.y = panelWorld.position.y - grabPoint.y;
+                    grabOffsetWorld.z = panelWorld.position.z - grabPoint.z;
+                    grabOrient = panelWorld.orientation;
+                }
             }
         } else {
             bool grabTrigger = (grabbedHand == 1) ? leftTrigger : rightTrigger;

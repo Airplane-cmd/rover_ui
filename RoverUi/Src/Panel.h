@@ -46,7 +46,8 @@ struct Panel {
 // Ray-cast hit result
 struct HitResult {
     int panelIdx;              // -1 if none
-    bool hitBar;               // true if hit was on display bar, false if on panel body
+    bool hitBar;               // true if hit was on display bar
+    int cornerIdx;             // 0=BL, 1=BR, 2=TL, 3=TR; -1 if not corner
     float distance;            // meters along ray
 };
 
@@ -90,6 +91,7 @@ private:
     XrSpace headSpace_ = XR_NULL_HANDLE;
     XrSpace localSpace_ = XR_NULL_HANDLE;
     std::vector<Panel> panels_;
+    XrSwapchain handleSc_ = XR_NULL_HANDLE;  // shared corner-handle texture
 };
 
 

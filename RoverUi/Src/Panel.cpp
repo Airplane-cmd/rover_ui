@@ -24,6 +24,11 @@ static bool VecFinite(const XrVector3f& v) {
     return v.x == v.x && v.y == v.y && v.z == v.z
         && std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
 }
+// forward decls (defined later in this file)
+static XrSwapchain CreateColorSwapchain(XrSession session, int32_t w, int32_t h);
+static void FillSwapchainSolid(XrSwapchain sc, float r, float g, float b, float a);
+
+
 
 
 // Bar geometry: below the panel, small and thin
@@ -32,11 +37,15 @@ static constexpr float BAR_WIDTH_RATIO = 0.25f; // 40% of panel width
 static constexpr float BAR_GAP_M = 0.015f;      // 2cm gap between panel bottom and bar
 static constexpr int32_t BAR_TEX_W = 64;
 static constexpr int32_t BAR_TEX_H = 16;
+static constexpr float HANDLE_SIZE_M = 0.025f;   // 2.5cm corner handle
+static constexpr int32_t HANDLE_TEX = 16;
 
 void PanelManager::Init(XrSession session, XrSpace headSpace, XrSpace localSpace) {
     session_ = session;
     headSpace_ = headSpace;
     localSpace_ = localSpace;
+    handleSc_ = CreateColorSwapchain(session, HANDLE_TEX, HANDLE_TEX);
+    FillSwapchainSolid(handleSc_, 0.85f, 0.85f, 0.90f, 0.95f);
 }
 
 void PanelManager::Shutdown() {
@@ -44,6 +53,7 @@ void PanelManager::Shutdown() {
         if (p.swapchain != XR_NULL_HANDLE) xrDestroySwapchain(p.swapchain);
         if (p.barSwapchain != XR_NULL_HANDLE) xrDestroySwapchain(p.barSwapchain);
     }
+    if (handleSc_ != XR_NULL_HANDLE) { xrDestroySwapchain(handleSc_); handleSc_ = XR_NULL_HANDLE; }
     panels_.clear();
 }
 
@@ -293,7 +303,7 @@ static bool RayQuadHit(const XrVector3f& ro, const XrVector3f& rd,
 
 HitResult PanelManager::Raycast(const XrVector3f& rayOrigin, const XrVector3f& rayDir,
                                  const XrPosef& headPoseInLocal) const {
-    HitResult best = {-1, false, 1e9f};
+    HitResult best = {-1, false, -1, 1e9f};
     for (int i = 0; i < static_cast<int>(panels_.size()); i++) {
         const Panel& p = panels_[i];
         XrPosef world = ResolveWorldPose(i, headPoseInLocal);
@@ -307,12 +317,29 @@ HitResult PanelManager::Raycast(const XrVector3f& rayOrigin, const XrVector3f& r
         float t = 0;
         // bar first (smaller, more specific target)
         if (RayQuadHit(rayOrigin, rayDir, barWorld, barW, BAR_HEIGHT_M, &t)) {
-            if (t < best.distance) { best = {i, true, t}; }
+            if (t < best.distance) { best = {i, true, -1, t}; }
         }
         // Also test body but only if no closer bar hit
         if (RayQuadHit(rayOrigin, rayDir, world, p.size.width, p.size.height, &t)) {
             if (t < best.distance && (best.panelIdx == -1 || !best.hitBar)) {
-                best = {i, false, t};
+                best = {i, false, -1, t};
+            }
+        }
+
+        // Corner handles (4). Same size, positioned at panel corners in local frame.
+        const float hw = p.size.width  * 0.5f;
+        const float hh = p.size.height * 0.5f;
+        const XrVector3f cornerOffs[4] = {
+            {-hw, -hh, 0}, { hw, -hh, 0}, {-hw,  hh, 0}, { hw,  hh, 0},
+        };
+        for (int c = 0; c < 4; c++) {
+            XrPosef cornerLocal = {{0,0,0,1}, cornerOffs[c]};
+            XrPosef cornerWorld = PoseMul(world, cornerLocal);
+            if (RayQuadHit(rayOrigin, rayDir, cornerWorld, HANDLE_SIZE_M, HANDLE_SIZE_M, &t)) {
+                // Corners take priority over body but not over bar
+                if (t < best.distance) {
+                    best = {i, false, c, t};
+                }
             }
         }
     }
@@ -375,6 +402,32 @@ void PanelManager::BuildLayers(XrCompositionLayerQuad* outQuads, int outCap, int
         q.subImage.imageArrayIndex = 0;
         q.size = {barW, BAR_HEIGHT_M};
         q.pose = barWorld;
+    }
+    // Corner handles: draw only for hovered panel to respect layer budget
+    for (int i = 0; i < static_cast<int>(panels_.size()); i++) {
+        if (count >= outCap) break;
+        const Panel& p = panels_[i];
+        if (!p.barHovered) continue;
+        XrPosef world = ResolveWorldPose(i, headPoseInLocal);
+        const float hw = p.size.width * 0.5f;
+        const float hh = p.size.height * 0.5f;
+        const XrVector3f offs[4] = { {-hw,-hh,0}, {hw,-hh,0}, {-hw,hh,0}, {hw,hh,0} };
+        for (int c = 0; c < 4 && count < outCap; c++) {
+            XrPosef corner = PoseMul(world, {{0,0,0,1}, offs[c]});
+            corner.orientation = QNorm(corner.orientation);
+            if (!VecFinite(corner.position)) continue;
+            XrCompositionLayerQuad& q = outQuads[count++];
+            q = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+            q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            q.space = localSpace_;
+            q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            q.subImage.swapchain = handleSc_;
+            q.subImage.imageRect.offset = {0, 0};
+            q.subImage.imageRect.extent = {HANDLE_TEX, HANDLE_TEX};
+            q.subImage.imageArrayIndex = 0;
+            q.size = {HANDLE_SIZE_M, HANDLE_SIZE_M};
+            q.pose = corner;
+        }
     }
     *outCount = count;
 }
