@@ -32,7 +32,7 @@
     <!-- Theme.Black.NoTitleBar.Fullscreen gives solid black instead of a (bad stereoscopic)
             gradient on app transition -->
     <activity
-        android:name="com.oculus.NativeActivity"
+        android:name="com.gantrping.rover.RoverActivity"
         android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
         android:launchMode="singleTask"
         android:screenOrientation="landscape"
