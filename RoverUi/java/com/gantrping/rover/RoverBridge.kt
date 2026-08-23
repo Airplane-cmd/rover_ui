@@ -28,17 +28,37 @@ object RoverBridge {
     @Volatile private var mpRequestPending: Boolean = false
     @Volatile private var mediaProjection: MediaProjection? = null
     @Volatile private var virtualDisplay: VirtualDisplay? = null
-    @Volatile private var surfaceTexture: SurfaceTexture? = null
+    @Volatile var surfaceTexture: SurfaceTexture? = null
+        private set
     @Volatile private var surface: Surface? = null
 
+    // Set by native BEFORE requestMediaProjection: the OES texture id backing the SurfaceTexture.
+    // If 0, we fall back to a detached texture (v0.4.2c behavior).
+    @Volatile private var externalOesTexId: Int = 0
+
+    @JvmStatic fun setActivity(a: Activity?) { activity = a; Log.i(TAG, "setActivity: $a") }
+
+    @JvmStatic fun helloFromKotlin(): String =
+        "hello from Kotlin! v0.4.2d1 activity=${activity != null}"
+
+    /** Called from native after native creates a GL_TEXTURE_EXTERNAL_OES texture. */
     @JvmStatic
-    fun setActivity(a: Activity?) {
-        activity = a
-        Log.i(TAG, "setActivity: $a")
+    fun setExternalOesTextureId(id: Int) {
+        externalOesTexId = id
+        Log.i(TAG, "setExternalOesTextureId($id)")
     }
 
+    /** Native calls this each frame to pump SurfaceTexture. Must run on the GL thread that owns the OES tex. */
     @JvmStatic
-    fun helloFromKotlin(): String = "hello from Kotlin! v0.4.2c-fix activity=${activity != null}"
+    fun updateSurfaceTexImage(): Boolean {
+        val st = surfaceTexture ?: return false
+        return try {
+            st.updateTexImage()
+            true
+        } catch (e: Throwable) {
+            Log.e(TAG, "updateTexImage failed", e); false
+        }
+    }
 
     @JvmStatic
     fun requestMediaProjection() {
@@ -50,15 +70,14 @@ object RoverBridge {
             try {
                 val mgr = a.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                 a.startActivityForResult(mgr.createScreenCaptureIntent(), REQ_MEDIA_PROJECTION)
-                Log.i(TAG, "consent dialog dispatched")
+                Log.i(TAG, "consent dialog dispatched (external OES id=$externalOesTexId)")
             } catch (e: Throwable) {
                 Log.e(TAG, "request failed", e); mpRequestPending = false
             }
         }
     }
 
-    @JvmStatic
-    fun isMediaProjectionGranted(): Boolean = mpResultCode != 0 && mpResultData != null
+    @JvmStatic fun isMediaProjectionGranted(): Boolean = mpResultCode != 0 && mpResultData != null
 
     @JvmStatic
     fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -68,9 +87,7 @@ object RoverBridge {
             mpResultCode = resultCode
             mpResultData = data
             Log.i(TAG, "granted=${isMediaProjectionGranted()}")
-            if (isMediaProjectionGranted()) {
-                startForegroundServiceThenCreate()
-            }
+            if (isMediaProjectionGranted()) startForegroundServiceThenCreate()
         }
     }
 
@@ -84,7 +101,6 @@ object RoverBridge {
         } catch (e: Throwable) {
             Log.e(TAG, "startForegroundService failed", e); return
         }
-        // Give service a moment to become foreground before calling getMediaProjection
         Handler(Looper.getMainLooper()).postDelayed({ createVirtualDisplay() }, 300)
     }
 
@@ -100,9 +116,11 @@ object RoverBridge {
                     override fun onStop() { Log.i(TAG, "MP onStop") }
                 }, null)
             }
-            surfaceTexture = SurfaceTexture(0).also {
-                it.setDefaultBufferSize(VD_WIDTH, VD_HEIGHT)
-                it.setOnFrameAvailableListener { Log.d(TAG, "frame available") }
+            val texId = externalOesTexId
+            surfaceTexture = if (texId != 0) SurfaceTexture(texId) else SurfaceTexture(0)
+            surfaceTexture!!.setDefaultBufferSize(VD_WIDTH, VD_HEIGHT)
+            surfaceTexture!!.setOnFrameAvailableListener {
+                Log.d(TAG, "frame available")
             }
             surface = Surface(surfaceTexture)
             virtualDisplay = mediaProjection!!.createVirtualDisplay(
@@ -111,7 +129,7 @@ object RoverBridge {
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                 surface, null, null
             )
-            Log.i(TAG, "VirtualDisplay created id=${virtualDisplay?.display?.displayId}")
+            Log.i(TAG, "VirtualDisplay id=${virtualDisplay?.display?.displayId} tex=$texId")
         } catch (e: Throwable) {
             Log.e(TAG, "createVirtualDisplay failed", e)
         }

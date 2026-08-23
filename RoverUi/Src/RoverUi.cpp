@@ -627,6 +627,47 @@ void UpdateStageBounds(App& app) {
 #if defined(XR_USE_PLATFORM_ANDROID)
 
 // v0.4.1: Kotlin bridge — call RoverBridge.helloFromKotlin() and log the result
+
+// GL_TEXTURE_EXTERNAL_OES constant (comes from GL_OES_EGL_image_external)
+#ifndef GL_TEXTURE_EXTERNAL_OES
+#define GL_TEXTURE_EXTERNAL_OES 0x8D65
+#endif
+
+static GLuint g_oesTextureId = 0;
+
+static void CallSetupOesTexture(struct android_app* androidApp) {
+    // Create OES texture in the current EGL context (called from android_main after Egl init)
+    glGenTextures(1, &g_oesTextureId);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, g_oesTextureId);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+    ALOGE("[rover] OES texture created id=%u", g_oesTextureId);
+
+    // Push id to Kotlin
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return;
+    jobject activity = androidApp->activity->clazz;
+    jclass actCls = env->GetObjectClass(activity);
+    jmethodID getCl = env->GetMethodID(actCls, "getClassLoader", "()Ljava/lang/ClassLoader;");
+    jobject clsLoader = env->CallObjectMethod(activity, getCl);
+    jclass clsLoaderCls = env->FindClass("java/lang/ClassLoader");
+    jmethodID loadClass = env->GetMethodID(clsLoaderCls, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+    jstring name = env->NewStringUTF("com.gantrping.rover.RoverBridge");
+    jclass cls = (jclass)env->CallObjectMethod(clsLoader, loadClass, name);
+    env->DeleteLocalRef(name); env->DeleteLocalRef(clsLoaderCls);
+    env->DeleteLocalRef(clsLoader); env->DeleteLocalRef(actCls);
+    if (!cls || env->ExceptionCheck()) { env->ExceptionClear(); return; }
+    jmethodID method = env->GetStaticMethodID(cls, "setExternalOesTextureId", "(I)V");
+    if (method) env->CallStaticVoidMethod(cls, method, (jint)g_oesTextureId);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+    env->DeleteLocalRef(cls);
+}
+
 // v0.4.2b: kick off MediaProjection consent dialog once at startup
 static void CallRequestMediaProjection(struct android_app* androidApp) {
     JavaVM* jvm = androidApp->activity->vm;
@@ -1159,6 +1200,8 @@ int main() {
     leftCursor.Init(app.Session);
     static rover::RayLine leftRayLine;
     leftRayLine.Init(app.Session);
+    // v0.4.2d1: create OES texture for MediaProjection SurfaceTexture; push id to Kotlin
+    CallSetupOesTexture(androidApp);
     {
         // Center panel: 0DoF (head-locked). Blue-ish. 40x30 cm at 1.5 m ahead.
         XrPosef pose0 = {{0,0,0,1}, {0.0f, 0.0f, -1.5f}};
