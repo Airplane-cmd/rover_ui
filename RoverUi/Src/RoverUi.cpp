@@ -668,6 +668,41 @@ static void CallSetupOesTexture(struct android_app* androidApp) {
     env->DeleteLocalRef(cls);
 }
 
+
+// v0.4.2d2: per-frame pump — call RoverBridge.updateSurfaceTexImage() via JNI
+static jclass g_bridgeCls = nullptr;
+static jmethodID g_updateTexMethod = nullptr;
+
+static void CacheBridgeClass(struct android_app* androidApp, JNIEnv* env) {
+    if (g_bridgeCls != nullptr) return;
+    jobject activity = androidApp->activity->clazz;
+    jclass actCls = env->GetObjectClass(activity);
+    jmethodID getCl = env->GetMethodID(actCls, "getClassLoader", "()Ljava/lang/ClassLoader;");
+    jobject clsLoader = env->CallObjectMethod(activity, getCl);
+    jclass clsLoaderCls = env->FindClass("java/lang/ClassLoader");
+    jmethodID loadClass = env->GetMethodID(clsLoaderCls, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+    jstring name = env->NewStringUTF("com.gantrping.rover.RoverBridge");
+    jclass cls = (jclass)env->CallObjectMethod(clsLoader, loadClass, name);
+    env->DeleteLocalRef(name); env->DeleteLocalRef(clsLoaderCls);
+    env->DeleteLocalRef(clsLoader); env->DeleteLocalRef(actCls);
+    if (!cls) { env->ExceptionClear(); return; }
+    g_bridgeCls = (jclass)env->NewGlobalRef(cls);
+    env->DeleteLocalRef(cls);
+    g_updateTexMethod = env->GetStaticMethodID(g_bridgeCls, "updateSurfaceTexImage", "()Z");
+}
+
+static bool CallUpdateSurfaceTexImage(struct android_app* androidApp) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return false;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls || !g_updateTexMethod) return false;
+    jboolean ok = env->CallStaticBooleanMethod(g_bridgeCls, g_updateTexMethod);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); return false; }
+    return ok == JNI_TRUE;
+}
+
 // v0.4.2b: kick off MediaProjection consent dialog once at startup
 static void CallRequestMediaProjection(struct android_app* androidApp) {
     JavaVM* jvm = androidApp->activity->vm;
@@ -1202,11 +1237,13 @@ int main() {
     leftRayLine.Init(app.Session);
     // v0.4.2d1: create OES texture for MediaProjection SurfaceTexture; push id to Kotlin
     CallSetupOesTexture(androidApp);
+    static rover::OesBlitter oesBlitter;
+    oesBlitter.Init();
     {
         // Center panel: 0DoF (head-locked). Blue-ish. 40x30 cm at 1.5 m ahead.
         XrPosef pose0 = {{0,0,0,1}, {0.0f, 0.0f, -1.5f}};
-        panelMgr.AddPanel(rover::DofMode::HeadLocked, pose0, {0.40f, 0.30f}, 0.15f, 0.35f, 0.60f, 0.85f);
-        panelMgr.PanelAt(0).dynamic = true;
+        panelMgr.AddPanel(rover::DofMode::HeadLocked, pose0, {0.40f, 0.30f}, 0.15f, 0.35f, 0.60f, 0.85f, 1024, 640);
+        panelMgr.PanelAt(0).oesSourced = true;
 
         // Left panel: 6DoF (world-anchored). Green. 40x30 cm at 1.5 m ahead + 0.6 m left.
         XrPosef pose1 = {{0,0,0,1}, {-0.6f, 0.0f, -1.5f}};
@@ -1911,6 +1948,13 @@ int main() {
 
         {
             panelMgr.UpdateDynamic(frameState.predictedDisplayTime * 1e-9f);
+            // v0.4.2d2: pump SurfaceTexture + blit OES into any oesSourced panel
+            if (g_oesTextureId != 0) {
+                CallUpdateSurfaceTexImage(androidApp);
+                for (int pi = 0; pi < (int)panelMgr.Panels().size(); pi++) {
+                    if (panelMgr.PanelAt(pi).oesSourced) oesBlitter.BlitToPanel(panelMgr.PanelAt(pi), g_oesTextureId);
+                }
+            }
             XrCompositionLayerQuad panelQuads[MaxLayerCount];
             int panelCount = 0;
             panelMgr.BuildLayers(panelQuads, MaxLayerCount, &panelCount, headInLocal);

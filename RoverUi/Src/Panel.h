@@ -42,6 +42,7 @@ struct Panel {
     float barHoverColor[4];    // bar color (hovered)
     bool barHovered;           // per-frame flag, set by input logic
     bool dynamic = false;      // if true, PanelManager::UpdateDynamic re-fills swapchain each frame
+    bool oesSourced = false;   // if true, sourced from a GL_TEXTURE_EXTERNAL_OES via OesBlitter
 };
 
 // Ray-cast hit result
@@ -135,6 +136,24 @@ private:
     XrSwapchain sc_ = XR_NULL_HANDLE;
     bool visible_ = false;
     bool active_ = false;
+};
+
+
+
+// Blits a GL_TEXTURE_EXTERNAL_OES texture into a panel's swapchain image via a shader + FBO.
+class OesBlitter {
+public:
+    bool Init();
+    void Shutdown();
+    // Acquire panel swapchain, sample OES texture into it, release.
+    // Returns false if setup failed (no-op).
+    bool BlitToPanel(Panel& p, unsigned int oesTexId);
+private:
+    unsigned int program_ = 0;
+    unsigned int vao_ = 0;
+    unsigned int vbo_ = 0;
+    int uTexLoc_ = -1;
+    bool ready_ = false;
 };
 
 } // namespace rover

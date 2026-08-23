@@ -4,6 +4,7 @@
  */
 
 #include "Panel.h"
+#include <android/log.h>
 #include <cmath>
 #include <cstring>
 #include <algorithm>
@@ -627,6 +628,133 @@ void PanelManager::UpdateDynamic(float time) {
         p.clearColor[3] = 0.85f;
         FillSwapchainSolid(p.swapchain, r, g, b, 0.85f);
     }
+}
+
+
+
+// ---------------- OesBlitter ----------------
+
+#ifndef GL_TEXTURE_EXTERNAL_OES
+#define GL_TEXTURE_EXTERNAL_OES 0x8D65
+#endif
+
+static const char* kOesVertex = R"(#version 300 es
+layout(location=0) in vec2 aPos;
+out vec2 vUV;
+void main() {
+    // Flip Y so SurfaceTexture (top-left origin) comes out right-side up
+    vUV = vec2(aPos.x * 0.5 + 0.5, 1.0 - (aPos.y * 0.5 + 0.5));
+    gl_Position = vec4(aPos, 0.0, 1.0);
+}
+)";
+
+static const char* kOesFragment = R"(#version 300 es
+#extension GL_OES_EGL_image_external_essl3 : require
+precision mediump float;
+uniform samplerExternalOES uTex;
+in vec2 vUV;
+out vec4 outColor;
+void main() {
+    outColor = texture(uTex, vUV);
+}
+)";
+
+static unsigned int CompileShader(unsigned int type, const char* src) {
+    unsigned int sh = glCreateShader(type);
+    glShaderSource(sh, 1, &src, nullptr);
+    glCompileShader(sh);
+    GLint ok = 0;
+    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[1024]; glGetShaderInfoLog(sh, sizeof log, nullptr, log);
+        // no ALOGE in Panel.cpp; use __android_log_print directly
+        __android_log_print(ANDROID_LOG_ERROR, "OesBlitter", "shader compile failed: %s", log);
+        glDeleteShader(sh); return 0;
+    }
+    return sh;
+}
+
+bool OesBlitter::Init() {
+    unsigned int vs = CompileShader(GL_VERTEX_SHADER, kOesVertex);
+    unsigned int fs = CompileShader(GL_FRAGMENT_SHADER, kOesFragment);
+    if (!vs || !fs) { if (vs) glDeleteShader(vs); if (fs) glDeleteShader(fs); return false; }
+    program_ = glCreateProgram();
+    glAttachShader(program_, vs); glAttachShader(program_, fs);
+    glLinkProgram(program_);
+    GLint ok = 0; glGetProgramiv(program_, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[1024]; glGetProgramInfoLog(program_, sizeof log, nullptr, log);
+        __android_log_print(ANDROID_LOG_ERROR, "OesBlitter", "link failed: %s", log);
+        glDeleteProgram(program_); program_ = 0; return false;
+    }
+    glDeleteShader(vs); glDeleteShader(fs);
+    uTexLoc_ = glGetUniformLocation(program_, "uTex");
+
+    // Fullscreen triangle strip (2 triangles)
+    static const float verts[] = { -1,-1,  1,-1,  -1,1,  1,1 };
+    glGenVertexArrays(1, &vao_);
+    glGenBuffers(1, &vbo_);
+    glBindVertexArray(vao_);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo_);
+    glBufferData(GL_ARRAY_BUFFER, sizeof verts, verts, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
+    glBindVertexArray(0);
+
+    ready_ = true;
+    __android_log_print(ANDROID_LOG_ERROR, "OesBlitter", "init ok prog=%u vao=%u", program_, vao_);
+    return true;
+}
+
+void OesBlitter::Shutdown() {
+    if (vbo_) glDeleteBuffers(1, &vbo_);
+    if (vao_) glDeleteVertexArrays(1, &vao_);
+    if (program_) glDeleteProgram(program_);
+    vbo_ = vao_ = program_ = 0; ready_ = false;
+}
+
+bool OesBlitter::BlitToPanel(Panel& p, unsigned int oesTexId) {
+    if (!ready_ || oesTexId == 0) return false;
+    if (p.swapchain == XR_NULL_HANDLE) return false;
+
+    // Acquire panel swapchain image
+    unsigned int len = 0;
+    OXR(xrEnumerateSwapchainImages(p.swapchain, 0, &len, nullptr));
+    auto* imgs = new XrSwapchainImageOpenGLESKHR[len];
+    for (unsigned int i = 0; i < len; i++) imgs[i] = {XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR};
+    OXR(xrEnumerateSwapchainImages(p.swapchain, len, &len,
+        reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs)));
+    uint32_t idx = 0;
+    XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    OXR(xrAcquireSwapchainImage(p.swapchain, &ai, &idx));
+    XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = XR_INFINITE_DURATION;
+    OXR(xrWaitSwapchainImage(p.swapchain, &wi));
+
+    GLuint fbo = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                            static_cast<GLuint>(imgs[idx].image), 0);
+    glViewport(0, 0, p.width, p.height);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glUseProgram(program_);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, oesTexId);
+    glUniform1i(uTexLoc_, 0);
+    glBindVertexArray(vao_);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glBindVertexArray(0);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+    glUseProgram(0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+
+    XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    OXR(xrReleaseSwapchainImage(p.swapchain, &ri));
+    delete[] imgs;
+    return true;
 }
 
 } // namespace rover
