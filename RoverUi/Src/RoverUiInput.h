@@ -55,3 +55,4 @@ extern XrActionStateBoolean leftTriggerState;
 extern XrActionStateBoolean rightTriggerState;
 extern XrActionStateVector2f leftThumbState;
 extern XrActionStateVector2f rightThumbState;
+extern XrActionStateBoolean rightBButtonState;

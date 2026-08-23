@@ -373,10 +373,13 @@ void App::Clear() {
 void App::HandleSessionStateChanges(XrSessionState state) {
     if (state == XR_SESSION_STATE_READY) {
 #if defined(XR_USE_PLATFORM_ANDROID)
+        static bool pendingBegin = false;
         if (!Resumed) {
             ALOGE("HandleSessionStateChanges: READY while not Resumed — deferring");
+            pendingBegin = true;
             return;
         }
+        pendingBegin = false;
 #endif
         if (SessionActive) return;
 
@@ -564,6 +567,10 @@ static void app_handle_cmd(struct android_app* androidApp, int32_t cmd) {
             ALOGV("onResume()");
             ALOGV("    APP_CMD_RESUME");
             app.Resumed = true;
+            // v0.4.2c-fix: if we deferred a READY handling while paused, retry now
+            if (!app.SessionActive) {
+                app.HandleSessionStateChanges(XR_SESSION_STATE_READY);
+            }
             break;
         }
         case APP_CMD_PAUSE: {
@@ -1626,6 +1633,15 @@ int main() {
         static XrExtent2Df resizeInitSize = {0.4f, 0.3f};
         static bool prevLeftTrigger = false;
         static bool prevRightTrigger = false;
+        static bool prevCaptureBtn = false;
+        {
+            bool cur = (rightBButtonState.type != 0 && rightBButtonState.currentState != XR_FALSE);
+            if (cur && !prevCaptureBtn) {
+                ALOGE("[rover] Right B pressed — requesting MediaProjection");
+                CallRequestMediaProjection(androidApp);
+            }
+            prevCaptureBtn = cur;
+        }
 
         auto locateCtrl = [&](XrSpace space, bool active, XrPosef* outPose, bool* outValid) {
             *outValid = false;

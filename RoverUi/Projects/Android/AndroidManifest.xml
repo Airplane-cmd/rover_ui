@@ -19,6 +19,9 @@
       android:name="com.oculus.feature.PASSTHROUGH"
       android:required="true"
       />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
   <application
       android:allowBackup="false"
       android:label="Rover UI"
@@ -52,5 +55,9 @@
         <category android:name="android.intent.category.LAUNCHER" />
       </intent-filter>
     </activity>
+    <service
+        android:name="com.gantrping.rover.MediaProjectionService"
+        android:foregroundServiceType="mediaProjection"
+        android:exported="false" />
   </application>
 </manifest>
