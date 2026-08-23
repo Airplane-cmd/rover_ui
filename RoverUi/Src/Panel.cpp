@@ -608,4 +608,25 @@ bool RayLine::BuildLayer(XrCompositionLayerQuad* out, XrSpace localSpace,
     return true;
 }
 
+
+
+void PanelManager::UpdateDynamic(float time) {
+    // For each dynamic panel: shift a base color's brightness with time.
+    // MVP: cycle through hues. Later phases replace this with real content (Kotlin bitmap, VirtualDisplay).
+    for (size_t i = 0; i < panels_.size(); i++) {
+        Panel& p = panels_[i];
+        if (!p.dynamic) continue;
+        // Simple HSV-like sweep: alternate through R/G/B with sinusoidal weights
+        float phase = time * 0.5f;  // slow cycle
+        float r = 0.5f + 0.35f * std::sin(phase + 0.0f);
+        float g = 0.5f + 0.35f * std::sin(phase + 2.094f);   // + 2*pi/3
+        float b = 0.5f + 0.35f * std::sin(phase + 4.188f);   // + 4*pi/3
+        p.clearColor[0] = r;
+        p.clearColor[1] = g;
+        p.clearColor[2] = b;
+        p.clearColor[3] = 0.85f;
+        FillSwapchainSolid(p.swapchain, r, g, b, 0.85f);
+    }
+}
+
 } // namespace rover

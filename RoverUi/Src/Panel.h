@@ -41,6 +41,7 @@ struct Panel {
     float barColor[4];         // bar color (idle)
     float barHoverColor[4];    // bar color (hovered)
     bool barHovered;           // per-frame flag, set by input logic
+    bool dynamic = false;      // if true, PanelManager::UpdateDynamic re-fills swapchain each frame
 };
 
 // Ray-cast hit result
@@ -62,6 +63,7 @@ public:
 
     void FillSolidColor(int panelIdx);
     void FillBar(int panelIdx, bool hovered);   // fills bar swapchain with idle or hover color
+    void UpdateDynamic(float time);
 
     // Compute the panel's current world pose (in localSpace) given current head pose.
     XrPosef ResolveWorldPose(int panelIdx, const XrPosef& headPoseInLocal) const;

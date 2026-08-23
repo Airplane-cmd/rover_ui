@@ -1078,6 +1078,7 @@ int main() {
         // Center panel: 0DoF (head-locked). Blue-ish. 40x30 cm at 1.5 m ahead.
         XrPosef pose0 = {{0,0,0,1}, {0.0f, 0.0f, -1.5f}};
         panelMgr.AddPanel(rover::DofMode::HeadLocked, pose0, {0.40f, 0.30f}, 0.15f, 0.35f, 0.60f, 0.85f);
+        panelMgr.PanelAt(0).dynamic = true;
 
         // Left panel: 6DoF (world-anchored). Green. 40x30 cm at 1.5 m ahead + 0.6 m left.
         XrPosef pose1 = {{0,0,0,1}, {-0.6f, 0.0f, -1.5f}};
@@ -1772,6 +1773,7 @@ int main() {
         float leftRayLen  = (leftHit.panelIdx >= 0)  ? leftHit.distance  : 3.0f;
 
         {
+            panelMgr.UpdateDynamic(frameState.predictedDisplayTime * 1e-9f);
             XrCompositionLayerQuad panelQuads[MaxLayerCount];
             int panelCount = 0;
             panelMgr.BuildLayers(panelQuads, MaxLayerCount, &panelCount, headInLocal);
