@@ -615,6 +615,48 @@ void UpdateStageBounds(App& app) {
  * event loop for receiving input events and doing other things.
  */
 #if defined(XR_USE_PLATFORM_ANDROID)
+
+// v0.4.1: Kotlin bridge — call RoverBridge.helloFromKotlin() and log the result
+static void CallHelloFromKotlin(struct android_app* androidApp) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) { ALOGE("CallHelloFromKotlin: no JNIEnv"); return; }
+
+    // FindClass on native thread uses bootstrap classloader; use activity ClassLoader instead.
+    jobject activity = androidApp->activity->clazz;
+    jclass actCls = env->GetObjectClass(activity);
+    jmethodID getCl = env->GetMethodID(actCls, "getClassLoader", "()Ljava/lang/ClassLoader;");
+    jobject clsLoader = env->CallObjectMethod(activity, getCl);
+    jclass clsLoaderCls = env->FindClass("java/lang/ClassLoader");
+    jmethodID loadClass = env->GetMethodID(clsLoaderCls, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
+    jstring clsName = env->NewStringUTF("com.gantrping.rover.RoverBridge");
+    jclass cls = (jclass)env->CallObjectMethod(clsLoader, loadClass, clsName);
+    env->DeleteLocalRef(clsName);
+    env->DeleteLocalRef(clsLoaderCls);
+    env->DeleteLocalRef(clsLoader);
+    env->DeleteLocalRef(actCls);
+    if (!cls || env->ExceptionCheck()) {
+        ALOGE("CallHelloFromKotlin: loadClass failed");
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        return;
+    }
+    jmethodID method = env->GetStaticMethodID(cls, "helloFromKotlin", "()Ljava/lang/String;");
+    if (!method) {
+        ALOGE("CallHelloFromKotlin: GetStaticMethodID failed");
+        env->ExceptionClear();
+        return;
+    }
+    jstring result = (jstring)env->CallStaticObjectMethod(cls, method);
+    if (!result) { ALOGE("CallHelloFromKotlin: null result"); return; }
+    const char* utf = env->GetStringUTFChars(result, nullptr);
+    ALOGE("[rover] Kotlin says: %s", utf);
+    env->ReleaseStringUTFChars(result, utf);
+    env->DeleteLocalRef(result);
+    env->DeleteLocalRef(cls);
+}
+
 void android_main(struct android_app* androidApp) {
 #else
 int main() {
@@ -623,6 +665,7 @@ int main() {
     ALOGV("----------------------------------------------------------------");
     ALOGV("android_app_entry()");
     ALOGV("    android_main()");
+    CallHelloFromKotlin(androidApp);
 
     JNIEnv* Env;
     (*androidApp->activity->vm).AttachCurrentThread(&Env, nullptr);
