@@ -373,9 +373,12 @@ void App::Clear() {
 void App::HandleSessionStateChanges(XrSessionState state) {
     if (state == XR_SESSION_STATE_READY) {
 #if defined(XR_USE_PLATFORM_ANDROID)
-        assert(Resumed);
-#endif // defined(XR_USE_PLATFORM_ANDROID)
-        assert(SessionActive == false);
+        if (!Resumed) {
+            ALOGE("HandleSessionStateChanges: READY while not Resumed — deferring");
+            return;
+        }
+#endif
+        if (SessionActive) return;
 
         XrSessionBeginInfo sessionBeginInfo = {XR_TYPE_SESSION_BEGIN_INFO};
         sessionBeginInfo.primaryViewConfigurationType = ViewportConfig.viewConfigurationType;
@@ -450,12 +453,12 @@ void App::HandleSessionStateChanges(XrSessionState state) {
         }
 #endif // defined(XR_USE_PLATFORM_ANDROID)
     } else if (state == XR_SESSION_STATE_STOPPING) {
-#if defined(XR_USE_PLATFORM_ANDROID)
-        assert(Resumed == false);
-#endif // defined(XR_USE_PLATFORM_ANDROID)
-        assert(SessionActive);
-        OXR(xrEndSession(Session));
-        SessionActive = false;
+        // v0.4.2b: MediaProjection dialog can put us into STOPPING before Resumed flips.
+        // Skip the pause assert and just end the session cleanly if it is active.
+        if (SessionActive) {
+            OXR(xrEndSession(Session));
+            SessionActive = false;
+        }
     }
 }
 
@@ -617,6 +620,36 @@ void UpdateStageBounds(App& app) {
 #if defined(XR_USE_PLATFORM_ANDROID)
 
 // v0.4.1: Kotlin bridge — call RoverBridge.helloFromKotlin() and log the result
+// v0.4.2b: kick off MediaProjection consent dialog once at startup
+static void CallRequestMediaProjection(struct android_app* androidApp) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return;
+    jobject activity = androidApp->activity->clazz;
+    jclass actCls = env->GetObjectClass(activity);
+    jmethodID getCl = env->GetMethodID(actCls, "getClassLoader", "()Ljava/lang/ClassLoader;");
+    jobject clsLoader = env->CallObjectMethod(activity, getCl);
+    jclass clsLoaderCls = env->FindClass("java/lang/ClassLoader");
+    jmethodID loadClass = env->GetMethodID(clsLoaderCls, "loadClass",
+        "(Ljava/lang/String;)Ljava/lang/Class;");
+    jstring name = env->NewStringUTF("com.gantrping.rover.RoverBridge");
+    jclass cls = (jclass)env->CallObjectMethod(clsLoader, loadClass, name);
+    env->DeleteLocalRef(name); env->DeleteLocalRef(clsLoaderCls);
+    env->DeleteLocalRef(clsLoader); env->DeleteLocalRef(actCls);
+    if (!cls || env->ExceptionCheck()) {
+        ALOGE("CallRequestMediaProjection: loadClass failed");
+        env->ExceptionDescribe(); env->ExceptionClear();
+        return;
+    }
+    jmethodID method = env->GetStaticMethodID(cls, "requestMediaProjection", "()V");
+    if (!method) { ALOGE("requestMediaProjection method not found"); env->ExceptionClear(); return; }
+    env->CallStaticVoidMethod(cls, method);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+    env->DeleteLocalRef(cls);
+    ALOGE("[rover] requestMediaProjection dispatched");
+}
+
 static void CallHelloFromKotlin(struct android_app* androidApp) {
     JavaVM* jvm = androidApp->activity->vm;
     JNIEnv* env = nullptr;
@@ -666,6 +699,8 @@ int main() {
     ALOGV("android_app_entry()");
     ALOGV("    android_main()");
     CallHelloFromKotlin(androidApp);
+    // v0.4.2b3: MediaProjection request deferred (blows up OpenXR lifecycle if called at startup).
+    // Wire it to a controller button in v0.4.2c instead.
 
     JNIEnv* Env;
     (*androidApp->activity->vm).AttachCurrentThread(&Env, nullptr);
