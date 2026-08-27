@@ -6,132 +6,164 @@ import android.content.Intent
 import android.graphics.SurfaceTexture
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
-import android.media.projection.MediaProjection
-import android.media.projection.MediaProjectionManager
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.Surface
+import java.io.BufferedReader
+import java.io.InputStreamReader
 
+/**
+ * v0.4.3a: no MediaProjection. DisplayManager.createVirtualDisplay directly.
+ * Requires android.permission.CAPTURE_VIDEO_OUTPUT (signature-level).
+ * Grant with: adb shell su -c "pm grant com.gantrping.rover android.permission.CAPTURE_VIDEO_OUTPUT"
+ */
 object RoverBridge {
     private const val TAG = "RoverBridge"
-    const val REQ_MEDIA_PROJECTION = 0x100
-
-    private const val VD_WIDTH = 1024
-    private const val VD_HEIGHT = 640
-    private const val VD_DPI = 320
+    private const val VD_INIT_W = 1843
+    private const val VD_INIT_H = 1152
+    private const val VD_DPI = 200
 
     @Volatile private var activity: Activity? = null
-    @Volatile private var mpResultCode: Int = 0
-    @Volatile private var mpResultData: Intent? = null
-    @Volatile private var mpRequestPending: Boolean = false
-    @Volatile private var mediaProjection: MediaProjection? = null
     @Volatile private var virtualDisplay: VirtualDisplay? = null
     @Volatile var surfaceTexture: SurfaceTexture? = null
         private set
     @Volatile private var surface: Surface? = null
-
-    // Set by native BEFORE requestMediaProjection: the OES texture id backing the SurfaceTexture.
-    // If 0, we fall back to a detached texture (v0.4.2c behavior).
+    @Volatile var virtualDisplayId: Int = -1
+        private set
     @Volatile private var externalOesTexId: Int = 0
+    @Volatile private var vdCreatePending: Boolean = false
+    private val stMatrix = FloatArray(16)
 
     @JvmStatic fun setActivity(a: Activity?) { activity = a; Log.i(TAG, "setActivity: $a") }
+    @JvmStatic fun helloFromKotlin(): String = "hello from Kotlin! v0.4.3a activity=${activity != null}"
+    @JvmStatic fun setExternalOesTextureId(id: Int) { externalOesTexId = id; Log.i(TAG, "setExternalOesTextureId($id)") }
 
-    @JvmStatic fun helloFromKotlin(): String =
-        "hello from Kotlin! v0.4.2d1 activity=${activity != null}"
-
-    /** Called from native after native creates a GL_TEXTURE_EXTERNAL_OES texture. */
-    @JvmStatic
-    fun setExternalOesTextureId(id: Int) {
-        externalOesTexId = id
-        Log.i(TAG, "setExternalOesTextureId($id)")
-    }
-
-    /** Native calls this each frame to pump SurfaceTexture. Must run on the GL thread that owns the OES tex. */
     @JvmStatic
     fun updateSurfaceTexImage(): Boolean {
         val st = surfaceTexture ?: return false
         return try {
             st.updateTexImage()
+            st.getTransformMatrix(stMatrix)
             true
-        } catch (e: Throwable) {
-            Log.e(TAG, "updateTexImage failed", e); false
+        } catch (e: Throwable) { Log.e(TAG, "updateTexImage failed", e); false }
+    }
+
+    @JvmStatic fun getSTMatrix(): FloatArray = stMatrix
+
+    // v0.4.3d: runtime configuration via adb broadcast
+    const val ACTION_CFG = "com.gantrping.rover.CFG"
+    private val launchedPackages = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+    @Volatile var currentDpi: Int = VD_DPI
+        private set
+    @Volatile var currentW: Int = VD_INIT_W
+        private set
+    @Volatile var currentH: Int = VD_INIT_H
+        private set
+    // Panel physical world size, in meters. Native reads via getPanelWorldW/H each frame and
+    // overwrites panelMgr.PanelAt(0).size when different.
+    @Volatile @JvmStatic var panelWorldW: Float = 1.024f
+        private set
+    @Volatile @JvmStatic var panelWorldH: Float = 0.640f
+        private set
+    @Volatile @JvmStatic var pixelsPerMeter: Float = 1000.0f
+        private set
+
+    @JvmStatic
+    fun applyCfg(dpi: Int, w: Int, h: Int, pW: Float, pH: Float, ppm: Float) {
+        if (dpi > 0) currentDpi = dpi
+        if (w > 0) currentW = w
+        if (h > 0) currentH = h
+        if (pW > 0f) panelWorldW = pW
+        if (pH > 0f) panelWorldH = pH
+        if (ppm > 0f) pixelsPerMeter = ppm
+        val vd = virtualDisplay
+        if (vd != null && (dpi > 0 || w > 0 || h > 0)) {
+            try {
+                vd.resize(currentW, currentH, currentDpi)
+                surfaceTexture?.setDefaultBufferSize(currentW, currentH)
+                Log.i(TAG, "applyCfg: VD -> ${currentW}x${currentH}@${currentDpi}dpi, panel ${panelWorldW}x${panelWorldH}m")
+            } catch (e: Throwable) { Log.e(TAG, "applyCfg resize failed", e) }
         }
     }
 
+
+    /** Idempotent. Creates the offscreen VirtualDisplay via DisplayManager (no mirror). */
     @JvmStatic
-    fun requestMediaProjection() {
-        val a = activity ?: run { Log.w(TAG, "no activity"); return }
-        if (mediaProjection != null) { Log.i(TAG, "already active"); return }
-        if (mpRequestPending) { Log.i(TAG, "already pending"); return }
-        mpRequestPending = true
+    fun ensureVirtualDisplay() {
+        Log.i(TAG, "ensureVirtualDisplay entered, vd=$virtualDisplay pending=$vdCreatePending activity=$activity oesTex=$externalOesTexId")
+        if (virtualDisplay != null) return
+        if (vdCreatePending) return
+        val a = activity ?: run { Log.w(TAG, "ensureVirtualDisplay: no activity"); return }
+        vdCreatePending = true
         a.runOnUiThread {
             try {
-                val mgr = a.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                a.startActivityForResult(mgr.createScreenCaptureIntent(), REQ_MEDIA_PROJECTION)
-                Log.i(TAG, "consent dialog dispatched (external OES id=$externalOesTexId)")
+                val texId = externalOesTexId
+                if (texId == 0) {
+                    Log.w(TAG, "ensureVirtualDisplay: OES tex id not set yet — retrying")
+                    vdCreatePending = false
+                    Handler(Looper.getMainLooper()).postDelayed({ ensureVirtualDisplay() }, 200)
+                    return@runOnUiThread
+                }
+                surfaceTexture = SurfaceTexture(texId).also {
+                    it.setDefaultBufferSize(VD_INIT_W, VD_INIT_H)
+                    it.setOnFrameAvailableListener { Log.d(TAG, "frame available") }
+                }
+                surface = Surface(surfaceTexture)
+                val dm = a.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+                val flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
+                            DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION or
+                            DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
+                virtualDisplay = dm.createVirtualDisplay(
+                    "rover-panel-0",
+                    VD_INIT_W, VD_INIT_H, VD_DPI,
+                    surface, flags
+                )
+                virtualDisplayId = virtualDisplay?.display?.displayId ?: -1
+                Log.i(TAG, "DisplayManager VirtualDisplay id=$virtualDisplayId tex=$texId (no mirror)")
             } catch (e: Throwable) {
-                Log.e(TAG, "request failed", e); mpRequestPending = false
+                Log.e(TAG, "ensureVirtualDisplay failed (permission missing?)", e)
+            } finally {
+                vdCreatePending = false
             }
         }
     }
-
-    @JvmStatic fun isMediaProjectionGranted(): Boolean = mpResultCode != 0 && mpResultData != null
 
     @JvmStatic
-    fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        Log.i(TAG, "onActivityResult req=$requestCode res=$resultCode data=$data")
-        if (requestCode == REQ_MEDIA_PROJECTION) {
-            mpRequestPending = false
-            mpResultCode = resultCode
-            mpResultData = data
-            Log.i(TAG, "granted=${isMediaProjectionGranted()}")
-            if (isMediaProjectionGranted()) startForegroundServiceThenCreate()
-        }
+    fun resizeVirtualDisplay(width: Int, height: Int, dpi: Int) {
+        val vd = virtualDisplay ?: return
+        try {
+            vd.resize(width, height, dpi)
+            surfaceTexture?.setDefaultBufferSize(width, height)
+            Log.i(TAG, "resizeVirtualDisplay to ${width}x${height}@${dpi}dpi")
+        } catch (e: Throwable) { Log.e(TAG, "resize failed", e) }
     }
 
-    private fun startForegroundServiceThenCreate() {
-        val a = activity ?: return
-        val svc = Intent(a, MediaProjectionService::class.java)
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) a.startForegroundService(svc)
-            else a.startService(svc)
-            Log.i(TAG, "foreground service start dispatched")
-        } catch (e: Throwable) {
-            Log.e(TAG, "startForegroundService failed", e); return
-        }
-        Handler(Looper.getMainLooper()).postDelayed({ createVirtualDisplay() }, 300)
+    @JvmStatic
+    fun launchAppOnDisplay(pkg: String, activityName: String, displayId: Int): Boolean {
+        val cmp = "$pkg/$activityName"
+        val cmd = "am force-stop $pkg; am start --display $displayId -f 0x10008000 -n $cmp"
+        launchedPackages.add(pkg)
+        Log.i(TAG, "launchAppOnDisplay: su -c \"$cmd\"")
+        return try {
+            val p = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
+            val out = BufferedReader(InputStreamReader(p.inputStream)).readText()
+            val err = BufferedReader(InputStreamReader(p.errorStream)).readText()
+            val rc = p.waitFor()
+            Log.i(TAG, "launch rc=$rc out=$out err=$err")
+            rc == 0
+        } catch (e: Throwable) { Log.e(TAG, "launch failed", e); false }
     }
 
-    private fun createVirtualDisplay() {
-        val a = activity ?: return
-        val d = mpResultData ?: return
-        val code = mpResultCode
+    @JvmStatic
+    fun cleanupLaunchedApps() {
+        val pkgs = synchronized(launchedPackages) { launchedPackages.toList() }
+        if (pkgs.isEmpty()) return
+        val cmd = pkgs.joinToString("; ") { "am force-stop $it" }
+        Log.i(TAG, "cleanupLaunchedApps: $cmd")
         try {
-            val mgr = a.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            mediaProjection = mgr.getMediaProjection(code, d).also { mp ->
-                Log.i(TAG, "MediaProjection obtained: $mp")
-                mp.registerCallback(object : MediaProjection.Callback() {
-                    override fun onStop() { Log.i(TAG, "MP onStop") }
-                }, null)
-            }
-            val texId = externalOesTexId
-            surfaceTexture = if (texId != 0) SurfaceTexture(texId) else SurfaceTexture(0)
-            surfaceTexture!!.setDefaultBufferSize(VD_WIDTH, VD_HEIGHT)
-            surfaceTexture!!.setOnFrameAvailableListener {
-                Log.d(TAG, "frame available")
-            }
-            surface = Surface(surfaceTexture)
-            virtualDisplay = mediaProjection!!.createVirtualDisplay(
-                "rover-panel-0",
-                VD_WIDTH, VD_HEIGHT, VD_DPI,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                surface, null, null
-            )
-            Log.i(TAG, "VirtualDisplay id=${virtualDisplay?.display?.displayId} tex=$texId")
-        } catch (e: Throwable) {
-            Log.e(TAG, "createVirtualDisplay failed", e)
-        }
+            Runtime.getRuntime().exec(arrayOf("su", "-c", cmd)).waitFor()
+        } catch (e: Throwable) { Log.e(TAG, "cleanup failed", e) }
+        launchedPackages.clear()
     }
 }

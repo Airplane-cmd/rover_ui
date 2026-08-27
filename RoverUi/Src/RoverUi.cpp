@@ -49,6 +49,11 @@ Authors   :
 
 #include "RoverUi.h"
 #include "Panel.h"
+
+// v0.4.2e: forward decls (definitions later in this file)
+static jclass g_bridgeCls = nullptr;
+static void CacheBridgeClass(struct android_app*, JNIEnv*);
+
 #include "RoverUiInput.h"
 #include "RoverUiGl.h"
 
@@ -669,8 +674,44 @@ static void CallSetupOesTexture(struct android_app* androidApp) {
 }
 
 
+
+static void CallLaunchAppOnDisplay(struct android_app* androidApp, const char* pkg, const char* act) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return;
+    // Read displayId via static field (or getter)
+    jfieldID fdId = env->GetStaticFieldID(g_bridgeCls, "virtualDisplayId", "I");
+    jint displayId = -1;
+    if (fdId) displayId = env->GetStaticIntField(g_bridgeCls, fdId);
+    if (displayId < 0) { ALOGE("[rover] launchApp: no display yet"); return; }
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "launchAppOnDisplay",
+        "(Ljava/lang/String;Ljava/lang/String;I)Z");
+    if (!m) { env->ExceptionClear(); return; }
+    jstring jp = env->NewStringUTF(pkg);
+    jstring ja = env->NewStringUTF(act);
+    env->CallStaticBooleanMethod(g_bridgeCls, m, jp, ja, displayId);
+    env->DeleteLocalRef(jp); env->DeleteLocalRef(ja);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+    ALOGE("[rover] launchAppOnDisplay(%s/%s, display=%d) called", pkg, act, displayId);
+}
+
+static bool IsMediaProjectionGranted(struct android_app* androidApp) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return false;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return false;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "isMediaProjectionGranted", "()Z");
+    if (!m) { env->ExceptionClear(); return false; }
+    return env->CallStaticBooleanMethod(g_bridgeCls, m) == JNI_TRUE;
+}
+
 // v0.4.2d2: per-frame pump — call RoverBridge.updateSurfaceTexImage() via JNI
-static jclass g_bridgeCls = nullptr;
+// (definition provided via forward decl above)
 static jmethodID g_updateTexMethod = nullptr;
 
 static void CacheBridgeClass(struct android_app* androidApp, JNIEnv* env) {
@@ -702,6 +743,95 @@ static bool CallUpdateSurfaceTexImage(struct android_app* androidApp) {
     if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); return false; }
     return ok == JNI_TRUE;
 }
+
+// v0.4.2f: fetch SurfaceTexture transform matrix from Kotlin (column-major 4x4)
+static bool CallGetSTMatrix(struct android_app* androidApp, float outMat[16]) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env || !g_bridgeCls) return false;
+    jmethodID mid = env->GetStaticMethodID(g_bridgeCls, "getSTMatrix", "()[F");
+    if (!mid) { if (env->ExceptionCheck()) env->ExceptionClear(); return false; }
+    jfloatArray arr = (jfloatArray)env->CallStaticObjectMethod(g_bridgeCls, mid);
+    if (!arr) { if (env->ExceptionCheck()) env->ExceptionClear(); return false; }
+    jsize n = env->GetArrayLength(arr);
+    if (n < 16) { env->DeleteLocalRef(arr); return false; }
+    env->GetFloatArrayRegion(arr, 0, 16, outMat);
+    env->DeleteLocalRef(arr);
+    return true;
+}
+
+// v0.4.3d: pull runtime panel world size from Kotlin (set via broadcast receiver)
+static bool CallGetPanelWorld(struct android_app* androidApp, float* outW, float* outH) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return false;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return false;
+    jmethodID mW = env->GetStaticMethodID(g_bridgeCls, "getPanelWorldW", "()F");
+    jmethodID mH = env->GetStaticMethodID(g_bridgeCls, "getPanelWorldH", "()F");
+    if (!mW || !mH) { env->ExceptionClear(); return false; }
+    *outW = env->CallStaticFloatMethod(g_bridgeCls, mW);
+    *outH = env->CallStaticFloatMethod(g_bridgeCls, mH);
+    return true;
+}
+
+// v0.4.3e: pull runtime pixels-per-meter density factor from Kotlin
+static float CallGetPixelsPerMeter(struct android_app* androidApp) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return 1000.f;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return 1000.f;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "getPixelsPerMeter", "()F");
+    if (!m) { env->ExceptionClear(); return 1000.f; }
+    float v = env->CallStaticFloatMethod(g_bridgeCls, m);
+    return v > 0.f ? v : 1000.f;
+}
+
+// v0.4.3e: pull runtime DPI (currentDpi) from Kotlin
+static int CallGetCurrentDpi(struct android_app* androidApp) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return 200;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return 200;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "getCurrentDpi", "()I");
+    if (!m) { env->ExceptionClear(); return 200; }
+    return env->CallStaticIntMethod(g_bridgeCls, m);
+}
+
+// v0.4.3a: no MP consent — Kotlin creates VD directly via DisplayManager
+static void CallEnsureVirtualDisplay(struct android_app* androidApp) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) { ALOGE("[rover] CallEnsureVirtualDisplay: no env"); return; }
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) { ALOGE("[rover] CallEnsureVirtualDisplay: no bridgeCls"); return; }
+    jmethodID mid = env->GetStaticMethodID(g_bridgeCls, "ensureVirtualDisplay", "()V");
+    if (mid) env->CallStaticVoidMethod(g_bridgeCls, mid);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
+// v0.4.2e: JNI helpers for VirtualDisplay resize + app launch
+
+static void CallResizeVirtualDisplay(struct android_app* androidApp, int w, int h, int dpi) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "resizeVirtualDisplay", "(III)V");
+    if (!m) { env->ExceptionClear(); return; }
+    env->CallStaticVoidMethod(g_bridgeCls, m, (jint)w, (jint)h, (jint)dpi);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
 
 // v0.4.2b: kick off MediaProjection consent dialog once at startup
 static void CallRequestMediaProjection(struct android_app* androidApp) {
@@ -1235,14 +1365,15 @@ int main() {
     leftCursor.Init(app.Session);
     static rover::RayLine leftRayLine;
     leftRayLine.Init(app.Session);
-    // v0.4.2d1: create OES texture for MediaProjection SurfaceTexture; push id to Kotlin
+    // v0.4.2d1: create OES texture; v0.4.3a: also kick off VirtualDisplay creation
     CallSetupOesTexture(androidApp);
+    CallEnsureVirtualDisplay(androidApp);
     static rover::OesBlitter oesBlitter;
     oesBlitter.Init();
     {
         // Center panel: 0DoF (head-locked). Blue-ish. 40x30 cm at 1.5 m ahead.
         XrPosef pose0 = {{0,0,0,1}, {0.0f, 0.0f, -1.5f}};
-        panelMgr.AddPanel(rover::DofMode::HeadLocked, pose0, {0.40f, 0.30f}, 0.15f, 0.35f, 0.60f, 0.85f, 1024, 640);
+        panelMgr.AddPanel(rover::DofMode::HeadLocked, pose0, {1.024f, 0.640f}, 0.15f, 0.35f, 0.60f, 0.85f, 1843, 1152);
         panelMgr.PanelAt(0).oesSourced = true;
 
         // Left panel: 6DoF (world-anchored). Green. 40x30 cm at 1.5 m ahead + 0.6 m left.
@@ -1708,19 +1839,35 @@ int main() {
         static XrVector3f grabOffsetWorld = {0,0,0};
         static XrQuaternionf grabOrient = {0,0,0,1};
         static int resizedIdx = -1;
+        static int ri_ctr = 0;
+        if ((ri_ctr++ % 30) == 0) ALOGE("[rover-dbg] tick resizedIdx=%d grabbedIdx=%d", resizedIdx, grabbedIdx);
         static int resizedHand = 0;
         static float resizeInitDist = 1.0f;
-        static XrExtent2Df resizeInitSize = {0.4f, 0.3f};
+        static XrExtent2Df resizeInitSize = {1.024f, 0.640f};
+        static float resizeInitGrabU = 0.f, resizeInitGrabV = 0.f;
+        static int resizedCorner = -1;
         static bool prevLeftTrigger = false;
         static bool prevRightTrigger = false;
         static bool prevCaptureBtn = false;
+        static int g_prevResizedIdx = -1;
         {
             bool cur = (rightBButtonState.type != 0 && rightBButtonState.currentState != XR_FALSE);
             if (cur && !prevCaptureBtn) {
-                ALOGE("[rover] Right B pressed — requesting MediaProjection");
-                CallRequestMediaProjection(androidApp);
+                ALOGE("[rover] Right B pressed — launch Termux into VD");
+                CallEnsureVirtualDisplay(androidApp);
+                CallLaunchAppOnDisplay(androidApp, "com.termux", "com.termux.app.TermuxActivity");
             }
             prevCaptureBtn = cur;
+        }
+        {
+            static bool prevLeftX = false;
+            bool cur = (leftXButtonState.type != 0 && leftXButtonState.currentState != XR_FALSE);
+            if (cur && !prevLeftX) {
+                ALOGE("[rover] Left X pressed — launch Telegram into VD");
+                CallEnsureVirtualDisplay(androidApp);
+                CallLaunchAppOnDisplay(androidApp, "org.telegram.messenger.web", "org.telegram.ui.LaunchActivity");
+            }
+            prevLeftX = cur;
         }
 
         auto locateCtrl = [&](XrSpace space, bool active, XrPosef* outPose, bool* outValid) {
@@ -1757,13 +1904,20 @@ int main() {
         rover::HitResult rightHit = {-1, false, -1, 0}, leftHit = {-1, false, -1, 0};
         if (rightCtrlValid) rightHit = panelMgr.Raycast(rightCtrl.position, computeRayDir(rightCtrl.orientation), headInLocal);
         if (leftCtrlValid)  leftHit  = panelMgr.Raycast(leftCtrl.position,  computeRayDir(leftCtrl.orientation),  headInLocal);
+        if (rightHit.cornerIdx >= 0 || leftHit.cornerIdx >= 0) {
+            static int hitctr = 0;
+            if ((hitctr++ % 15) == 0) ALOGE("[rover-dbg] corner hit R.pi=%d R.corner=%d L.pi=%d L.corner=%d",
+                rightHit.panelIdx, rightHit.cornerIdx, leftHit.panelIdx, leftHit.cornerIdx);
+        }
         // For legacy cursor path: use grabbing hand hit if grabbing, else right, else left
         rover::HitResult hit = rightHit;
         if (grabbedHand == 1) hit = leftHit;
         else if (!rightCtrlValid && leftCtrlValid) hit = leftHit;
 
         if (resizedIdx >= 0) {
-            // RESIZE update: scale panel by current-dist / init-dist
+            // v0.4.3c: PER-AXIS resize. Project ray onto panel plane, decompose delta from
+            // initial grab-point into panel's local X/Y basis, and scale w/h independently.
+            // Corner index (0=BL,1=BR,2=TL,3=TR) determines the sign of growth on each axis.
             bool grabTrigger = (resizedHand == 1) ? leftTrigger : rightTrigger;
             bool grabValid   = (resizedHand == 1) ? leftCtrlValid : rightCtrlValid;
             XrPosef grabCtrl = (resizedHand == 1) ? leftCtrl : rightCtrl;
@@ -1772,27 +1926,63 @@ int main() {
                 resizedHand = 0;
                 panelMgr.SetHovered(-1);
             } else {
-                XrVector3f rd = computeRayDir(grabCtrl.orientation);
                 XrPosef panelWorld = panelMgr.ResolveWorldPose(resizedIdx, headInLocal);
-                // Use same grabDist-along-ray as when starting; simplest: intersect ray with plane through panel center parallel to panel face
-                // For MVP: use fixed initial distance approximation via current controller-to-panel-center dist
-                float px = grabCtrl.position.x - panelWorld.position.x;
-                float py = grabCtrl.position.y - panelWorld.position.y;
-                float pz = grabCtrl.position.z - panelWorld.position.z;
-                float ctrl_to_center = std::sqrt(px*px + py*py + pz*pz);
-                // grab point ~ controller + ctrl_to_center * ray direction
-                float gpx = grabCtrl.position.x + ctrl_to_center * rd.x;
-                float gpy = grabCtrl.position.y + ctrl_to_center * rd.y;
-                float gpz = grabCtrl.position.z + ctrl_to_center * rd.z;
-                float ddx = gpx - panelWorld.position.x;
-                float ddy = gpy - panelWorld.position.y;
-                float ddz = gpz - panelWorld.position.z;
-                float cur = std::sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
-                float scale = cur / resizeInitDist;
-                if (scale < 0.2f) scale = 0.2f;
-                if (scale > 5.0f) scale = 5.0f;
-                panelMgr.PanelAt(resizedIdx).size.width  = resizeInitSize.width  * scale;
-                panelMgr.PanelAt(resizedIdx).size.height = resizeInitSize.height * scale;
+                XrVector3f rd = computeRayDir(grabCtrl.orientation);
+
+                // Panel local basis in world coords
+                auto qrot = [](const XrQuaternionf& q, XrVector3f v) {
+                    // v' = q * v * q^-1
+                    float x=q.x,y=q.y,z=q.z,w=q.w;
+                    float ix =  w*v.x + y*v.z - z*v.y;
+                    float iy =  w*v.y + z*v.x - x*v.z;
+                    float iz =  w*v.z + x*v.y - y*v.x;
+                    float iw = -x*v.x - y*v.y - z*v.z;
+                    return XrVector3f{
+                        ix*w + iw*-x + iy*-z - iz*-y,
+                        iy*w + iw*-y + iz*-x - ix*-z,
+                        iz*w + iw*-z + ix*-y - iy*-x
+                    };
+                };
+                XrVector3f axisX = qrot(panelWorld.orientation, {1,0,0});
+                XrVector3f axisY = qrot(panelWorld.orientation, {0,1,0});
+                XrVector3f axisZ = qrot(panelWorld.orientation, {0,0,1});
+
+                // Ray-plane intersection: plane through panel center, normal = axisZ
+                float denom = rd.x*axisZ.x + rd.y*axisZ.y + rd.z*axisZ.z;
+                float gpx=0, gpy=0, gpz=0;
+                if (std::fabs(denom) > 1e-4f) {
+                    float d = (panelWorld.position.x - grabCtrl.position.x)*axisZ.x
+                            + (panelWorld.position.y - grabCtrl.position.y)*axisZ.y
+                            + (panelWorld.position.z - grabCtrl.position.z)*axisZ.z;
+                    float t = d / denom;
+                    gpx = grabCtrl.position.x + t * rd.x;
+                    gpy = grabCtrl.position.y + t * rd.y;
+                    gpz = grabCtrl.position.z + t * rd.z;
+                } else {
+                    gpx = panelWorld.position.x; gpy = panelWorld.position.y; gpz = panelWorld.position.z;
+                }
+
+                // Project current hit-point into panel local (u,v) meters from center
+                float relX = gpx - panelWorld.position.x;
+                float relY = gpy - panelWorld.position.y;
+                float relZ = gpz - panelWorld.position.z;
+                float u = relX*axisX.x + relY*axisX.y + relZ*axisX.z;
+                float v = relX*axisY.x + relY*axisY.y + relZ*axisY.z;
+
+                // Corner sign: BL(0)=(-1,-1) BR(1)=(+1,-1) TL(2)=(-1,+1) TR(3)=(+1,+1)
+                float sX = (resizedCorner == 1 || resizedCorner == 3) ? +1.f : -1.f;
+                float sY = (resizedCorner == 2 || resizedCorner == 3) ? +1.f : -1.f;
+
+                // Meta-style: resize centered — new half-extent = signed distance from center along that axis
+                // So new_width  = 2 * |u|, new_height = 2 * |v|. Guard against zero, apply corner-sign so
+                // dragging OUTWARD grows and INWARD shrinks (per axis independently).
+                float newW = resizeInitSize.width  + 2.f * sX * (u - resizeInitGrabU);
+                float newH = resizeInitSize.height + 2.f * sY * (v - resizeInitGrabV);
+                // v0.4.3f: caps removed on user request; keep tiny mins so panel can't collapse to zero
+                if (newW < 0.1f) newW = 0.1f;
+                if (newH < 0.1f) newH = 0.1f;
+                panelMgr.PanelAt(resizedIdx).size.width  = newW;
+                panelMgr.PanelAt(resizedIdx).size.height = newH;
                 panelMgr.SetHovered(resizedIdx);
             }
             prevLeftTrigger = leftTrigger;
@@ -1820,15 +2010,31 @@ int main() {
                     useCtrl.position.z + useHit.distance * rd.z,
                 };
                 if (useHit.cornerIdx >= 0) {
-                    // Start RESIZE
+                    ALOGE("[rover-dbg] START RESIZE pi=%d corner=%d hand=%d", useHit.panelIdx, useHit.cornerIdx, hand);
                     resizedIdx = useHit.panelIdx;
                     resizedHand = hand;
-                    float dx = grabPoint.x - panelWorld.position.x;
-                    float dy = grabPoint.y - panelWorld.position.y;
-                    float dz = grabPoint.z - panelWorld.position.z;
-                    resizeInitDist = std::sqrt(dx*dx + dy*dy + dz*dz);
-                    if (resizeInitDist < 0.02f) resizeInitDist = 0.02f;
+                    resizedCorner = useHit.cornerIdx;
                     resizeInitSize = panelMgr.PanelAt(useHit.panelIdx).size;
+                    // Project initial grab point into panel local (u,v) so per-axis math has a baseline
+                    auto qrot2 = [](const XrQuaternionf& q, XrVector3f v) {
+                        float x=q.x,y=q.y,z=q.z,w=q.w;
+                        float ix =  w*v.x + y*v.z - z*v.y;
+                        float iy =  w*v.y + z*v.x - x*v.z;
+                        float iz =  w*v.z + x*v.y - y*v.x;
+                        float iw = -x*v.x - y*v.y - z*v.z;
+                        return XrVector3f{
+                            ix*w + iw*-x + iy*-z - iz*-y,
+                            iy*w + iw*-y + iz*-x - ix*-z,
+                            iz*w + iw*-z + ix*-y - iy*-x
+                        };
+                    };
+                    XrVector3f axX = qrot2(panelWorld.orientation, {1,0,0});
+                    XrVector3f axY = qrot2(panelWorld.orientation, {0,1,0});
+                    float rx = grabPoint.x - panelWorld.position.x;
+                    float ry = grabPoint.y - panelWorld.position.y;
+                    float rz = grabPoint.z - panelWorld.position.z;
+                    resizeInitGrabU = rx*axX.x + ry*axX.y + rz*axX.z;
+                    resizeInitGrabV = rx*axY.x + ry*axY.y + rz*axY.z;
                 } else {
                     // Start MOVE
                     grabbedIdx = useHit.panelIdx;
@@ -1914,6 +2120,40 @@ int main() {
                 panelMgr.SetHovered(grabbedIdx);
             }
         }
+        // v0.4.3e (revised): hybrid — physical resize feels immediate (world size updates every frame),
+        // and on stability (~15 frames after last change) we fire VD.resize + swapchain rebuild
+        // at physicalSize * pixelsPerMeter so the app re-layouts at new pixel resolution.
+        {
+            static float lastW = -1.0f, lastH = -1.0f;
+            static int stableCount = 0;
+            static int lastCommittedW = 0, lastCommittedH = 0;
+            const auto& p0 = panelMgr.PanelAt(0);
+            const float eps = 0.001f;
+            bool sizeChanged = (std::fabs(p0.size.width  - lastW) > eps) ||
+                               (std::fabs(p0.size.height - lastH) > eps);
+            if (sizeChanged) {
+                lastW = p0.size.width;
+                lastH = p0.size.height;
+                stableCount = 0;
+            } else {
+                stableCount++;
+            }
+            float ppm = CallGetPixelsPerMeter(androidApp);
+            int dpi = CallGetCurrentDpi(androidApp);
+            int wantW = (int)(p0.size.width  * ppm);
+            int wantH = (int)(p0.size.height * ppm);
+            if (wantW < 320) wantW = 320; if (wantH < 240) wantH = 240;
+            if (wantW > 8192) wantW = 8192; if (wantH > 8192) wantH = 8192;
+            if (stableCount == 15 && (wantW != lastCommittedW || wantH != lastCommittedH)) {
+                ALOGE("[rover] COMMIT %.3fx%.3fm -> %dx%dpx @ %ddpi (ppm=%.0f)",
+                    p0.size.width, p0.size.height, wantW, wantH, dpi, ppm);
+                CallResizeVirtualDisplay(androidApp, wantW, wantH, dpi);
+                panelMgr.ResizePanelSwapchain(0, wantW, wantH);
+                lastCommittedW = wantW;
+                lastCommittedH = wantH;
+            }
+        }
+        g_prevResizedIdx = resizedIdx;
         prevLeftTrigger = leftTrigger;
         prevRightTrigger = rightTrigger;
 
@@ -1946,13 +2186,48 @@ int main() {
         float rightRayLen = (rightHit.panelIdx >= 0) ? rightHit.distance : 3.0f;
         float leftRayLen  = (leftHit.panelIdx >= 0)  ? leftHit.distance  : 3.0f;
 
+        // v0.4.3d: only apply Kotlin panel size when broadcast actually changed it
+        {
+            float rw=0.f, rh=0.f;
+            static float lastRw=1.024f, lastRh=0.640f;
+            if (CallGetPanelWorld(androidApp, &rw, &rh) && rw > 0 && rh > 0) {
+                if (std::fabs(rw - lastRw) > 0.001f || std::fabs(rh - lastRh) > 0.001f) {
+                    panelMgr.PanelAt(0).size.width = rw;
+                    panelMgr.PanelAt(0).size.height = rh;
+                    lastRw = rw; lastRh = rh;
+                    ALOGE("[rover] applied broadcast panel size %.3fx%.3f", rw, rh);
+                }
+            }
+        }
+        { static int fs_ctr = 0;
+            if ((fs_ctr++ % 30) == 0) {
+                for (int i = 0; i < (int)panelMgr.Panels().size(); i++) {
+                    const auto& pp = panelMgr.PanelAt(i);
+                    ALOGE("[rover-dbg] panel %d worldWH=%.3fx%.3f swapWH=%dx%d oes=%d",
+                        i, pp.size.width, pp.size.height, pp.width, pp.height, pp.oesSourced?1:0);
+                }
+            }
+        }
         {
             panelMgr.UpdateDynamic(frameState.predictedDisplayTime * 1e-9f);
             // v0.4.2d2: pump SurfaceTexture + blit OES into any oesSourced panel
+            static bool g_launchedTestApp = false;
             if (g_oesTextureId != 0) {
                 CallUpdateSurfaceTexImage(androidApp);
-                for (int pi = 0; pi < (int)panelMgr.Panels().size(); pi++) {
-                    if (panelMgr.PanelAt(pi).oesSourced) oesBlitter.BlitToPanel(panelMgr.PanelAt(pi), g_oesTextureId);
+for (int pi = 0; pi < (int)panelMgr.Panels().size(); pi++) {
+                    if (panelMgr.PanelAt(pi).oesSourced) {
+                        float kStMat[16]; bool haveMat = CallGetSTMatrix(androidApp, kStMat);
+                        static int dbg_ctr = 0;
+                        if ((dbg_ctr++ % 30) == 0) {
+                            ALOGE("[rover-dbg] pi=%d oesTex=%u swapWH=%dx%d worldWH=%.3fx%.3f haveMat=%d ST=[%.3f %.3f %.3f %.3f|%.3f %.3f %.3f %.3f|%.3f %.3f %.3f %.3f|%.3f %.3f %.3f %.3f]",
+                                pi, g_oesTextureId, panelMgr.PanelAt(pi).width, panelMgr.PanelAt(pi).height, panelMgr.PanelAt(pi).size.width, panelMgr.PanelAt(pi).size.height, haveMat?1:0,
+                                kStMat[0],kStMat[1],kStMat[2],kStMat[3],
+                                kStMat[4],kStMat[5],kStMat[6],kStMat[7],
+                                kStMat[8],kStMat[9],kStMat[10],kStMat[11],
+                                kStMat[12],kStMat[13],kStMat[14],kStMat[15]);
+                        }
+                        oesBlitter.BlitToPanel(panelMgr.PanelAt(pi), g_oesTextureId, haveMat ? kStMat : nullptr);
+                    }
                 }
             }
             XrCompositionLayerQuad panelQuads[MaxLayerCount];

@@ -93,6 +93,7 @@ static void FillSwapchainSolid(XrSwapchain sc, float r, float g, float b, float 
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
                             static_cast<GLuint>(imgs[idx].image), 0);
+    glDisable(GL_SCISSOR_TEST);
     glClearColor(r, g, b, a);
     glClear(GL_COLOR_BUFFER_BIT);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -139,6 +140,23 @@ void PanelManager::FillBar(int panelIdx, bool hovered) {
     const Panel& p = panels_[panelIdx];
     const float* c = hovered ? p.barHoverColor : p.barColor;
     FillSwapchainSolid(p.barSwapchain, c[0], c[1], c[2], c[3]);
+}
+
+
+bool PanelManager::ResizePanelSwapchain(int panelIdx, int32_t newW, int32_t newH) {
+    if (panelIdx < 0 || panelIdx >= (int)panels_.size()) return false;
+    Panel& p = panels_[panelIdx];
+    if (p.swapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(p.swapchain);
+        p.swapchain = XR_NULL_HANDLE;
+    }
+    p.swapchain = CreateColorSwapchain(session_, newW, newH);
+    if (p.swapchain == XR_NULL_HANDLE) return false;
+    p.width = newW;
+    p.height = newH;
+    // For oesSourced panels, don't fill solid color — OesBlitter will populate next frame.
+    if (!p.oesSourced) FillSolidColor(panelIdx);
+    return true;
 }
 
 static float ExtractYaw(const XrQuaternionf& q) {
@@ -640,10 +658,12 @@ void PanelManager::UpdateDynamic(float time) {
 
 static const char* kOesVertex = R"(#version 300 es
 layout(location=0) in vec2 aPos;
+uniform mat4 uSTMatrix;
 out vec2 vUV;
 void main() {
-    // Flip Y so SurfaceTexture (top-left origin) comes out right-side up
-    vUV = vec2(aPos.x * 0.5 + 0.5, 1.0 - (aPos.y * 0.5 + 0.5));
+    // Raw UV in [0,1]; SurfaceTexture's transform matrix handles crop + Y-flip.
+    vec2 raw = vec2(aPos.x * 0.5 + 0.5, aPos.y * 0.5 + 0.5);
+    vUV = (uSTMatrix * vec4(raw, 0.0, 1.0)).xy;
     gl_Position = vec4(aPos, 0.0, 1.0);
 }
 )";
@@ -655,7 +675,8 @@ uniform samplerExternalOES uTex;
 in vec2 vUV;
 out vec4 outColor;
 void main() {
-    outColor = texture(uTex, vUV);
+    vec4 c = texture(uTex, vUV);
+    outColor = vec4(c.rgb, 1.0);  // force opaque: VD may produce alpha=0 pixels
 }
 )";
 
@@ -689,6 +710,7 @@ bool OesBlitter::Init() {
     }
     glDeleteShader(vs); glDeleteShader(fs);
     uTexLoc_ = glGetUniformLocation(program_, "uTex");
+    uSTMatrixLoc_ = glGetUniformLocation(program_, "uSTMatrix");
 
     // Fullscreen triangle strip (2 triangles)
     static const float verts[] = { -1,-1,  1,-1,  -1,1,  1,1 };
@@ -713,7 +735,7 @@ void OesBlitter::Shutdown() {
     vbo_ = vao_ = program_ = 0; ready_ = false;
 }
 
-bool OesBlitter::BlitToPanel(Panel& p, unsigned int oesTexId) {
+bool OesBlitter::BlitToPanel(Panel& p, unsigned int oesTexId, const float* stMatrix4x4) {
     if (!ready_ || oesTexId == 0) return false;
     if (p.swapchain == XR_NULL_HANDLE) return false;
 
@@ -736,13 +758,21 @@ bool OesBlitter::BlitToPanel(Panel& p, unsigned int oesTexId) {
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
                             static_cast<GLuint>(imgs[idx].image), 0);
-    glViewport(0, 0, p.width, p.height);
+    // v0.4.3a: over-size viewport so blit covers full swapchain even if runtime rounded up
+    glViewport(0, 0, 4096, 4096);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    // v0.4.3a: clear to opaque black so unfilled pixels are not transparent
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
     glUseProgram(program_);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, oesTexId);
     glUniform1i(uTexLoc_, 0);
+    static const float kIdentity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    const float* mat = stMatrix4x4 ? stMatrix4x4 : kIdentity;
+    if (uSTMatrixLoc_ >= 0) glUniformMatrix4fv(uSTMatrixLoc_, 1, GL_FALSE, mat);
     glBindVertexArray(vao_);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glBindVertexArray(0);

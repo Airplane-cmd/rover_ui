@@ -89,6 +89,10 @@ public:
     const std::vector<Panel>& Panels() const { return panels_; }
     Panel& PanelAt(int idx) { return panels_[idx]; }
 
+    // Destroy + recreate a panel's swapchain at new pixel dimensions.
+    // Returns true on success. Updates p.width/p.height.
+    bool ResizePanelSwapchain(int panelIdx, int32_t newW, int32_t newH);
+
 private:
     XrSession session_ = XR_NULL_HANDLE;
     XrSpace headSpace_ = XR_NULL_HANDLE;
@@ -147,12 +151,13 @@ public:
     void Shutdown();
     // Acquire panel swapchain, sample OES texture into it, release.
     // Returns false if setup failed (no-op).
-    bool BlitToPanel(Panel& p, unsigned int oesTexId);
+    bool BlitToPanel(Panel& p, unsigned int oesTexId, const float* stMatrix4x4 /*column-major, may be null*/);
 private:
     unsigned int program_ = 0;
     unsigned int vao_ = 0;
     unsigned int vbo_ = 0;
     int uTexLoc_ = -1;
+    int uSTMatrixLoc_ = -1;
     bool ready_ = false;
 };
 
