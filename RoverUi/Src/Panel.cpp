@@ -758,8 +758,8 @@ bool OesBlitter::BlitToPanel(Panel& p, unsigned int oesTexId, const float* stMat
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
                             static_cast<GLuint>(imgs[idx].image), 0);
-    // v0.4.3a: over-size viewport so blit covers full swapchain even if runtime rounded up
-    glViewport(0, 0, 4096, 4096);
+    // v0.4.3g: correct viewport to actual swap dims (was 4096x4096 which made triangles cover only 6.25% of FBO)
+    glViewport(0, 0, p.width, p.height);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_BLEND);
     glDisable(GL_SCISSOR_TEST);
