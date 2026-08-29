@@ -43,6 +43,7 @@ Authors   :
 #include <android_native_app_glue.h>
 #else
 #include <thread>
+#include <chrono>
 #endif // defined(ANDROID)
 
 #include <assert.h>
@@ -829,6 +830,48 @@ static void CallResizeVirtualDisplay(struct android_app* androidApp, int w, int 
     jmethodID m = env->GetStaticMethodID(g_bridgeCls, "resizeVirtualDisplay", "(III)V");
     if (!m) { env->ExceptionClear(); return; }
     env->CallStaticVoidMethod(g_bridgeCls, m, (jint)w, (jint)h, (jint)dpi);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
+
+// v0.5.1: input injection helpers — shell out to "input" via su
+static int CallGetPanelDisplayId(struct android_app* androidApp) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return -1;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return -1;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "getPanelDisplayId", "()I");
+    if (!m) { env->ExceptionClear(); return -1; }
+    jint r = env->CallStaticIntMethod(g_bridgeCls, m);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); return -1; }
+    return (int)r;
+}
+
+static void CallInjectTap(struct android_app* androidApp, int displayId, int x, int y) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "injectTap", "(III)Z");
+    if (!m) { env->ExceptionClear(); return; }
+    env->CallStaticBooleanMethod(g_bridgeCls, m, (jint)displayId, (jint)x, (jint)y);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
+static void CallInjectSwipe(struct android_app* androidApp, int displayId, int x1, int y1, int x2, int y2, int durationMs) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "injectSwipe", "(IIIIII)Z");
+    if (!m) { env->ExceptionClear(); return; }
+    env->CallStaticBooleanMethod(g_bridgeCls, m, (jint)displayId, (jint)x1, (jint)y1, (jint)x2, (jint)y2, (jint)durationMs);
     if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
 }
 
@@ -1838,6 +1881,10 @@ int main() {
         static float grabDist = 1.5f;
         static XrVector3f grabOffsetWorld = {0,0,0};
         static XrQuaternionf grabOrient = {0,0,0,1};
+        static int tapHand = 0;         // 0=none, 1=left, 2=right — currently tracking a tap
+        static int tapPanelIdx = -1;
+        static float tapStartU = 0.f, tapStartV = 0.f;  // UV (0..1, 0=top-left) at tap start
+        static long tapStartTimeMs = 0;
         static int resizedIdx = -1;
         static int ri_ctr = 0;
         if ((ri_ctr++ % 30) == 0) ALOGE("[rover-dbg] tick resizedIdx=%d grabbedIdx=%d", resizedIdx, grabbedIdx);
@@ -2036,15 +2083,51 @@ int main() {
                     resizeInitGrabU = rx*axX.x + ry*axX.y + rz*axX.z;
                     resizeInitGrabV = rx*axY.x + ry*axY.y + rz*axY.z;
                 } else {
-                    // Start MOVE
-                    grabbedIdx = useHit.panelIdx;
-                    grabbedHand = hand;
-                    grabDist = useHit.distance;
-                    if (grabDist < 0.2f) grabDist = 0.2f;
-                    grabOffsetWorld.x = panelWorld.position.x - grabPoint.x;
-                    grabOffsetWorld.y = panelWorld.position.y - grabPoint.y;
-                    grabOffsetWorld.z = panelWorld.position.z - grabPoint.z;
-                    grabOrient = panelWorld.orientation;
+                    const auto& pRef = panelMgr.PanelAt(useHit.panelIdx);
+                    if (pRef.oesSourced && !useHit.hitBar) {
+                        // v0.5.1: OES panel body — start TAP tracking, DON'T grab.
+                        // Use same panel-local math as resize (axX, axY already computed above? no — recompute).
+                        auto qrot3 = [](const XrQuaternionf& q, XrVector3f v) {
+                            float x=q.x,y=q.y,z=q.z,w=q.w;
+                            float ix =  w*v.x + y*v.z - z*v.y;
+                            float iy =  w*v.y + z*v.x - x*v.z;
+                            float iz =  w*v.z + x*v.y - y*v.x;
+                            float iw = -x*v.x - y*v.y - z*v.z;
+                            return XrVector3f{
+                                ix*w + iw*-x + iy*-z - iz*-y,
+                                iy*w + iw*-y + iz*-x - ix*-z,
+                                iz*w + iw*-z + ix*-y - iy*-x
+                            };
+                        };
+                        XrVector3f axX = qrot3(panelWorld.orientation, {1,0,0});
+                        XrVector3f axY = qrot3(panelWorld.orientation, {0,1,0});
+                        float rx = grabPoint.x - panelWorld.position.x;
+                        float ry = grabPoint.y - panelWorld.position.y;
+                        float rz = grabPoint.z - panelWorld.position.z;
+                        float u_m = rx*axX.x + ry*axX.y + rz*axX.z;  // meters from center along panel X (+ = right)
+                        float v_m = rx*axY.x + ry*axY.y + rz*axY.z;  // meters from center along panel Y (+ = up)
+                        float uv_u = (u_m + 0.5f * pRef.size.width)  / pRef.size.width;   // 0=left  1=right
+                        float uv_v = 1.0f - (v_m + 0.5f * pRef.size.height) / pRef.size.height;  // 0=top   1=bottom (Android UI)
+                        tapHand = hand;
+                        tapPanelIdx = useHit.panelIdx;
+                        tapStartU = uv_u;
+                        tapStartV = uv_v;
+                        tapStartTimeMs = (long)(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count());
+                        ALOGE("[rover-tap] START pi=%d hand=%d uv=(%.3f,%.3f) px=(%d,%d)",
+                            useHit.panelIdx, hand, uv_u, uv_v,
+                            (int)(uv_u * pRef.width), (int)(uv_v * pRef.height));
+                    } else {
+                        // Start MOVE (existing — solid panel or bar hit)
+                        grabbedIdx = useHit.panelIdx;
+                        grabbedHand = hand;
+                        grabDist = useHit.distance;
+                        if (grabDist < 0.2f) grabDist = 0.2f;
+                        grabOffsetWorld.x = panelWorld.position.x - grabPoint.x;
+                        grabOffsetWorld.y = panelWorld.position.y - grabPoint.y;
+                        grabOffsetWorld.z = panelWorld.position.z - grabPoint.z;
+                        grabOrient = panelWorld.orientation;
+                    }
                 }
             }
         } else {
@@ -2154,6 +2237,95 @@ int main() {
             }
         }
         g_prevResizedIdx = resizedIdx;
+
+        // v0.5.1: tap release detection — fires tap or long-press based on held duration
+        if (tapHand != 0 && tapPanelIdx >= 0) {
+            bool stillHeld = (tapHand == 1) ? leftTrigger : rightTrigger;
+            if (!stillHeld) {
+                const auto& p = panelMgr.PanelAt(tapPanelIdx);
+                int x = (int)(tapStartU * p.width);
+                int y = (int)(tapStartV * p.height);
+                if (x < 0) x = 0; if (x >= p.width) x = p.width - 1;
+                if (y < 0) y = 0; if (y >= p.height) y = p.height - 1;
+                int did = CallGetPanelDisplayId(androidApp);
+                long nowMs = (long)(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+                long held = nowMs - tapStartTimeMs;
+                ALOGE("[rover-tap] FIRE did=%d px=(%d,%d) held=%ldms", did, x, y, held);
+                if (did >= 0) {
+                    if (held < 500) {
+                        CallInjectTap(androidApp, did, x, y);      // quick tap
+                    } else {
+                        // long-press: same start & end, hold for `held` ms
+                        CallInjectSwipe(androidApp, did, x, y, x, y, (int)held);
+                    }
+                }
+                tapHand = 0;
+                tapPanelIdx = -1;
+            }
+        }
+
+        // v0.5.1: scroll via thumbstick Y — while hovering over OES panel body
+        {
+            static long lastScrollMs = 0;
+            long nowScroll = (long)(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+            if (nowScroll - lastScrollMs >= 50) {   // fire at ~20Hz
+                const float DEAD = 0.15f;
+                for (int hand = 1; hand <= 2; hand++) {
+                    const rover::HitResult& h = (hand == 1) ? leftHit : rightHit;
+                    if (h.panelIdx < 0 || h.hitBar || h.cornerIdx >= 0) continue;
+                    const auto& p = panelMgr.PanelAt(h.panelIdx);
+                    if (!p.oesSourced) continue;
+                    float sy = (hand == 1) ? leftThumbState.currentState.y : rightThumbState.currentState.y;
+                    if (std::fabs(sy) < DEAD) continue;
+                    // Compute hit UV in pixels via same math as tap
+                    auto qrot4 = [](const XrQuaternionf& q, XrVector3f v) {
+                        float x=q.x,y=q.y,z=q.z,w=q.w;
+                        float ix =  w*v.x + y*v.z - z*v.y;
+                        float iy =  w*v.y + z*v.x - x*v.z;
+                        float iz =  w*v.z + x*v.y - y*v.x;
+                        float iw = -x*v.x - y*v.y - z*v.z;
+                        return XrVector3f{
+                            ix*w + iw*-x + iy*-z - iz*-y,
+                            iy*w + iw*-y + iz*-x - ix*-z,
+                            iz*w + iw*-z + ix*-y - iy*-x
+                        };
+                    };
+                    XrPosef panelWorld = panelMgr.ResolveWorldPose(h.panelIdx, headInLocal);
+                    XrPosef ctrl = (hand == 1) ? leftCtrl : rightCtrl;
+                    XrVector3f rd = computeRayDir(ctrl.orientation);
+                    XrVector3f hp = { ctrl.position.x + h.distance*rd.x, ctrl.position.y + h.distance*rd.y, ctrl.position.z + h.distance*rd.z };
+                    XrVector3f axX = qrot4(panelWorld.orientation, {1,0,0});
+                    XrVector3f axY = qrot4(panelWorld.orientation, {0,1,0});
+                    float rx = hp.x - panelWorld.position.x;
+                    float ry = hp.y - panelWorld.position.y;
+                    float rz = hp.z - panelWorld.position.z;
+                    float u_m = rx*axX.x + ry*axX.y + rz*axX.z;
+                    float v_m = rx*axY.x + ry*axY.y + rz*axY.z;
+                    float uv_u = (u_m + 0.5f * p.size.width)  / p.size.width;
+                    float uv_v = 1.0f - (v_m + 0.5f * p.size.height) / p.size.height;
+                    int cx = (int)(uv_u * p.width);
+                    int cy = (int)(uv_v * p.height);
+                    if (cx < 0) cx = 0; if (cx >= p.width) cx = p.width - 1;
+                    if (cy < 0) cy = 0; if (cy >= p.height) cy = p.height - 1;
+                    // Swipe from (cx, cy - delta) to (cx, cy + delta), sy>0 = up on stick = scroll UP page = touch swipes DOWN (natural)
+                    // Ensure delta always > tap-threshold so Android sees swipe not tap
+                    int delta = (int)(sy * 400.0f);
+                    int minDelta = 120; if (sy > 0) { if (delta < minDelta) delta = minDelta; } else { if (delta > -minDelta) delta = -minDelta; }
+                    int y1 = cy - delta / 2;
+                    int y2 = cy + delta / 2;
+                    if (y1 < 0) y1 = 0; if (y2 >= p.height) y2 = p.height - 1;
+                    int did = CallGetPanelDisplayId(androidApp);
+                    if (did >= 0) {
+                        CallInjectSwipe(androidApp, did, cx, y1, cx, y2, 100);
+                    }
+                    lastScrollMs = nowScroll;
+                    break;  // one hand per tick
+                }
+            }
+        }
+
         prevLeftTrigger = leftTrigger;
         prevRightTrigger = rightTrigger;
 

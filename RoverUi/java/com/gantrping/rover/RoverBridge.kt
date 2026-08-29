@@ -8,6 +8,8 @@ import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.os.Handler
 import android.os.Looper
+import android.net.LocalSocket
+import android.net.LocalSocketAddress
 import android.util.Log
 import android.view.Surface
 import java.io.BufferedReader
@@ -141,6 +143,7 @@ object RoverBridge {
 
     @JvmStatic
     fun launchAppOnDisplay(pkg: String, activityName: String, displayId: Int): Boolean {
+        Thread { ensureInjectorRunning() }.start()
         val cmp = "$pkg/$activityName"
         val cmd = "am force-stop $pkg; am start --display $displayId -f 0x10008000 -n $cmp"
         launchedPackages.add(pkg)
@@ -153,6 +156,86 @@ object RoverBridge {
             Log.i(TAG, "launch rc=$rc out=$out err=$err")
             rc == 0
         } catch (e: Throwable) { Log.e(TAG, "launch failed", e); false }
+    }
+
+    @JvmStatic
+    fun getPanelDisplayId(): Int = virtualDisplayId
+
+    @JvmStatic
+    fun injectTap(displayId: Int, x: Int, y: Int): Boolean =
+        sendInject("TAP $displayId $x $y")
+
+    @JvmStatic
+    fun injectSwipe(displayId: Int, x1: Int, y1: Int, x2: Int, y2: Int, durationMs: Int): Boolean =
+        sendInject("SWIPE $displayId $x1 $y1 $x2 $y2 $durationMs")
+
+    private val execExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+
+    @Volatile private var injectorSpawned = false
+    private val injectorSpawnLock = Any()
+    private const val INJECTOR_SOCKET = "rover_inject"
+
+    @JvmStatic
+    fun ensureInjectorRunning(): Boolean {
+        if (injectorSpawned) return true
+        synchronized(injectorSpawnLock) {
+            if (injectorSpawned) return true
+            val ctx = activity ?: return false
+            val apkPath = try {
+                ctx.packageManager.getApplicationInfo(ctx.packageName, 0).sourceDir
+            } catch (e: Throwable) { Log.e(TAG, "apkPath lookup failed", e); return false }
+            // Check if socket already alive (daemon spawned by prior instance still up)
+            try {
+                LocalSocket().use { s ->
+                    s.connect(LocalSocketAddress(INJECTOR_SOCKET, LocalSocketAddress.Namespace.ABSTRACT))
+                    injectorSpawned = true
+                    Log.i(TAG, "injector already alive, reusing")
+                    return true
+                }
+            } catch (_: Throwable) { }
+            val spawn = "CLASSPATH=$apkPath /system/bin/app_process /system/bin " +
+                        "com.gantrping.rover.InjectorMain >/data/local/tmp/rover_inject.log 2>&1 &"
+            Log.i(TAG, "spawning injector: $spawn")
+            try {
+                Runtime.getRuntime().exec(arrayOf("su", "-c", spawn)).waitFor()
+            } catch (e: Throwable) {
+                Log.e(TAG, "injector spawn failed", e); return false
+            }
+            val deadline = System.currentTimeMillis() + 3000
+            while (System.currentTimeMillis() < deadline) {
+                try {
+                    LocalSocket().use { s ->
+                        s.connect(LocalSocketAddress(INJECTOR_SOCKET, LocalSocketAddress.Namespace.ABSTRACT))
+                        injectorSpawned = true
+                        Log.i(TAG, "injector ready")
+                        return true
+                    }
+                } catch (_: Throwable) { Thread.sleep(50) }
+            }
+            Log.e(TAG, "injector spawned but socket never came up")
+            return false
+        }
+    }
+
+    private fun sendInject(cmd: String): Boolean {
+        if (!injectorSpawned) {
+            // Kick off spawn on bg thread; drop this event, next will land
+            Thread { ensureInjectorRunning() }.start()
+            return false
+        }
+        execExecutor.submit {
+            try {
+                val s = LocalSocket()
+                s.connect(LocalSocketAddress(INJECTOR_SOCKET, LocalSocketAddress.Namespace.ABSTRACT))
+                s.outputStream.write("$cmd\n".toByteArray())
+                s.outputStream.flush()
+                s.close()
+            } catch (e: Throwable) {
+                Log.e(TAG, "sendInject async failed: $cmd", e)
+                injectorSpawned = false
+            }
+        }
+        return true
     }
 
     @JvmStatic

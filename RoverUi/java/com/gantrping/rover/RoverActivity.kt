@@ -31,6 +31,7 @@ class RoverActivity : NativeActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         RoverBridge.setActivity(this)
+        Thread { RoverBridge.ensureInjectorRunning() }.start()
         val filter = IntentFilter(RoverBridge.ACTION_CFG)
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(cfgReceiver, filter, Context.RECEIVER_EXPORTED)
