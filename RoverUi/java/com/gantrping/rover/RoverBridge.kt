@@ -122,6 +122,9 @@ object RoverBridge {
                     surface, flags
                 )
                 virtualDisplayId = virtualDisplay?.display?.displayId ?: -1
+                // v0.5.2: try to route IME to our VD via reflection through root daemon
+                val did = virtualDisplayId
+                if (did >= 0) Thread { ensureInjectorRunning(); setDisplayImePolicy(did, 0) }.start()
                 Log.i(TAG, "DisplayManager VirtualDisplay id=$virtualDisplayId tex=$texId (no mirror)")
             } catch (e: Throwable) {
                 Log.e(TAG, "ensureVirtualDisplay failed (permission missing?)", e)
@@ -162,8 +165,15 @@ object RoverBridge {
     fun getPanelDisplayId(): Int = virtualDisplayId
 
     @JvmStatic
-    fun injectTap(displayId: Int, x: Int, y: Int): Boolean =
-        sendInject("TAP $displayId $x $y")
+    fun setDisplayImePolicy(displayId: Int, policy: Int): Boolean =
+        sendInject("IME_POLICY $displayId $policy")
+
+    @JvmStatic
+    fun injectTap(displayId: Int, x: Int, y: Int): Boolean {
+        // v0.5.2: re-assert IME LOCAL policy on every tap — Meta shell keeps resetting it
+        sendInject("IME_POLICY $displayId 0")
+        return sendInject("TAP $displayId $x $y")
+    }
 
     @JvmStatic
     fun injectSwipe(displayId: Int, x1: Int, y1: Int, x2: Int, y2: Int, durationMs: Int): Boolean =

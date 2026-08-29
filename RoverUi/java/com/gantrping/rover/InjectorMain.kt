@@ -35,6 +35,9 @@ object InjectorMain {
     // Track down-time per hand so MOVE/UP link back to the correct gesture
     private var downTimeMs: Long = 0L
 
+    private var wms: Any? = null
+    private var setImePolicyMethod: java.lang.reflect.Method? = null
+
     @JvmStatic
     fun main(args: Array<String>) {
         try {
@@ -58,6 +61,19 @@ object InjectorMain {
                 Int::class.javaPrimitiveType
             )
 
+            // Also try WMS for IME policy setting (optional; only used by IME_POLICY cmd)
+            try {
+                val wmg = Class.forName("android.view.WindowManagerGlobal")
+                wms = wmg.getMethod("getWindowManagerService").invoke(null)
+                setImePolicyMethod = wms?.javaClass?.getMethod(
+                    "setDisplayImePolicy",
+                    Int::class.javaPrimitiveType,
+                    Int::class.javaPrimitiveType
+                )
+                log("WMS ok; setDisplayImePolicy method resolved")
+            } catch (e: Throwable) {
+                log("WMS setup failed: ${e.message}")
+            }
             log("started; im=${im.javaClass.name}")
 
             val server = LocalServerSocket(SOCKET_NAME)
@@ -128,6 +144,20 @@ object InjectorMain {
                 "UP" -> {
                     val did = parts[1].toInt(); val x = parts[2].toFloat(); val y = parts[3].toFloat()
                     sendEvent(did, MotionEvent.ACTION_UP, x, y, downTimeMs)
+                }
+                "IME_POLICY" -> {
+                    val did = parts[1].toInt()
+                    val pol = parts[2].toInt()  // 0=LOCAL, 1=FALLBACK, 2=HIDE
+                    val m = setImePolicyMethod
+                    val w = wms
+                    if (m != null && w != null) {
+                        m.invoke(w, did, pol)
+                        log("IME_POLICY did=$did pol=$pol OK")
+                        out.write("OK\n".toByteArray()); out.flush()
+                    } else {
+                        log("IME_POLICY: WMS not available")
+                        out.write("ERR\n".toByteArray()); out.flush()
+                    }
                 }
                 "PING" -> { out.write("PONG\n".toByteArray()); out.flush() }
                 else -> log("unknown cmd: $line")
