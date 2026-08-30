@@ -4,6 +4,7 @@ import android.net.LocalServerSocket
 import android.os.Looper
 import android.os.SystemClock
 import android.view.InputDevice
+import android.view.KeyEvent
 import android.view.MotionEvent
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -103,6 +104,7 @@ object InjectorMain {
     }
 
     private fun handleCommand(line: String, out: java.io.OutputStream) {
+        log("recv: $line")
         val parts = line.trim().split(" ")
         if (parts.isEmpty()) return
         try {
@@ -159,6 +161,17 @@ object InjectorMain {
                         out.write("ERR\n".toByteArray()); out.flush()
                     }
                 }
+                "KEY" -> {
+                    val did = parts[1].toInt()
+                    val code = parts[2].toInt()
+                    val meta = if (parts.size >= 4) parts[3].toInt() else 0
+                    injectKeyEvent(did, code, meta)
+                }
+                "TEXT" -> {
+                    val did = parts[1].toInt()
+                    val text = line.substringAfter(parts[0]).substringAfter(parts[1]).trim()
+                    injectText(did, text)
+                }
                 "PING" -> { out.write("PONG\n".toByteArray()); out.flush() }
                 else -> log("unknown cmd: $line")
             }
@@ -174,6 +187,38 @@ object InjectorMain {
         setDisplayIdMethod.invoke(e, displayId)
         injectMethod.invoke(im, e, INJECT_MODE_ASYNC)
         e.recycle()
+    }
+
+    private fun injectKeyEvent(displayId: Int, keycode: Int, meta: Int = 0) {
+        val now = SystemClock.uptimeMillis()
+        for (action in intArrayOf(KeyEvent.ACTION_DOWN, KeyEvent.ACTION_UP)) {
+            val e = KeyEvent(now, now, action, keycode, 0, meta, 0, 0,
+                KeyEvent.FLAG_FROM_SYSTEM, InputDevice.SOURCE_KEYBOARD)
+            try {
+                val setDispIdKe = KeyEvent::class.java.getMethod("setDisplayId", Int::class.javaPrimitiveType)
+                setDispIdKe.invoke(e, displayId)
+            } catch (_: Throwable) { /* older Android may lack this on KeyEvent */ }
+            injectMethod.invoke(im, e, 0)
+        }
+    }
+
+    private fun injectText(displayId: Int, text: String) {
+        log("injectText did=$displayId text= len=${text.length}")
+        // Fast path: for a-z / A-Z / 0-9 / space, use direct KeyCharacterMap.
+        val kcm = android.view.KeyCharacterMap.load(android.view.KeyCharacterMap.VIRTUAL_KEYBOARD)
+        val events = kcm.getEvents(text.toCharArray())
+        if (events == null) { log("injectText: KCM.getEvents returned null for "); return }
+        log("injectText: firing ${events.size} events")
+        for (raw in events) {
+            val e = KeyEvent(raw.downTime, raw.eventTime, raw.action, raw.keyCode,
+                raw.repeatCount, raw.metaState, raw.deviceId, raw.scanCode,
+                raw.flags or KeyEvent.FLAG_FROM_SYSTEM, raw.source)
+            try {
+                val setDispIdKe = KeyEvent::class.java.getMethod("setDisplayId", Int::class.javaPrimitiveType)
+                setDispIdKe.invoke(e, displayId)
+            } catch (_: Throwable) {}
+            injectMethod.invoke(im, e, 0)
+        }
     }
 
     private fun log(msg: String) {

@@ -325,6 +325,7 @@ HitResult PanelManager::Raycast(const XrVector3f& rayOrigin, const XrVector3f& r
     HitResult best = {-1, false, -1, 1e9f};
     for (int i = 0; i < static_cast<int>(panels_.size()); i++) {
         const Panel& p = panels_[i];
+        if (!p.visible) continue;
         XrPosef world = ResolveWorldPose(i, headPoseInLocal);
 
         // bar center: below panel by (h/2 + gap + BAR_HEIGHT/2), same orientation
@@ -383,6 +384,7 @@ void PanelManager::BuildLayers(XrCompositionLayerQuad* outQuads, int outCap, int
     for (int i = 0; i < static_cast<int>(panels_.size()); i++) {
         if (count >= outCap) break;
         const Panel& p = panels_[i];
+        if (!p.visible) continue;
         XrPosef world = ResolveWorldPose(i, headPoseInLocal);
         world.orientation = QNorm(world.orientation);
         if (!VecFinite(world.position)) continue;
@@ -402,6 +404,7 @@ void PanelManager::BuildLayers(XrCompositionLayerQuad* outQuads, int outCap, int
     for (int i = 0; i < static_cast<int>(panels_.size()); i++) {
         if (count >= outCap) break;
         const Panel& p = panels_[i];
+        if (!p.visible) continue;
         XrPosef world = ResolveWorldPose(i, headPoseInLocal);
         float barCenterOffsetY = -(p.size.height * 0.5f + BAR_GAP_M + BAR_HEIGHT_M * 0.5f);
         XrPosef barLocalOffset = {{0,0,0,1}, {0, barCenterOffsetY, 0}};
@@ -426,6 +429,7 @@ void PanelManager::BuildLayers(XrCompositionLayerQuad* outQuads, int outCap, int
     for (int i = 0; i < static_cast<int>(panels_.size()); i++) {
         if (count >= outCap) break;
         const Panel& p = panels_[i];
+        if (!p.visible) continue;
         if (!p.barHovered) continue;
         XrPosef world = ResolveWorldPose(i, headPoseInLocal);
         const float hw = p.size.width * 0.5f;
@@ -672,11 +676,13 @@ static const char* kOesFragment = R"(#version 300 es
 #extension GL_OES_EGL_image_external_essl3 : require
 precision mediump float;
 uniform samplerExternalOES uTex;
+uniform float uForceOpaque;  // 1.0=force alpha=1; 0.0=preserve source alpha
 in vec2 vUV;
 out vec4 outColor;
 void main() {
     vec4 c = texture(uTex, vUV);
-    outColor = vec4(c.rgb, 1.0);  // force opaque: VD may produce alpha=0 pixels
+    float a = mix(c.a, 1.0, uForceOpaque);
+    outColor = vec4(c.rgb, a);
 }
 )";
 
@@ -711,6 +717,7 @@ bool OesBlitter::Init() {
     glDeleteShader(vs); glDeleteShader(fs);
     uTexLoc_ = glGetUniformLocation(program_, "uTex");
     uSTMatrixLoc_ = glGetUniformLocation(program_, "uSTMatrix");
+    uForceOpaqueLoc_ = glGetUniformLocation(program_, "uForceOpaque");
 
     // Fullscreen triangle strip (2 triangles)
     static const float verts[] = { -1,-1,  1,-1,  -1,1,  1,1 };
@@ -770,6 +777,7 @@ bool OesBlitter::BlitToPanel(Panel& p, unsigned int oesTexId, const float* stMat
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, oesTexId);
     glUniform1i(uTexLoc_, 0);
+    glUniform1f(uForceOpaqueLoc_, p.oesForceOpaque ? 1.0f : 0.0f);
     static const float kIdentity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
     const float* mat = stMatrix4x4 ? stMatrix4x4 : kIdentity;
     if (uSTMatrixLoc_ >= 0) glUniformMatrix4fv(uSTMatrixLoc_, 1, GL_FALSE, mat);

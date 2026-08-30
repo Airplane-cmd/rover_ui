@@ -43,6 +43,10 @@ struct Panel {
     bool barHovered;           // per-frame flag, set by input logic
     bool dynamic = false;      // if true, PanelManager::UpdateDynamic re-fills swapchain each frame
     bool oesSourced = false;   // if true, sourced from a GL_TEXTURE_EXTERNAL_OES via OesBlitter
+    unsigned int oesTextureId = 0;  // per-panel OES tex; 0 falls back to caller-supplied default
+    bool isKeyboard = false;   // if true, hit-tests dispatch to KeyboardTexture (via JNI) instead of tap injection
+    bool visible = true;       // v0.7.2: false = skip in layer build + hit-test (hide keyboard)
+    bool oesForceOpaque = true; // v0.7.2: false = OES blit preserves source alpha
 };
 
 // Ray-cast hit result
@@ -158,6 +162,7 @@ private:
     unsigned int vbo_ = 0;
     int uTexLoc_ = -1;
     int uSTMatrixLoc_ = -1;
+    int uForceOpaqueLoc_ = -1;
     bool ready_ = false;
 };
 

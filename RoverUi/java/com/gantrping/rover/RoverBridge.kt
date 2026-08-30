@@ -32,14 +32,124 @@ object RoverBridge {
         private set
     @Volatile private var surface: Surface? = null
     @Volatile var virtualDisplayId: Int = -1
+    @Volatile @JvmStatic var lastTappedOesDisplayId: Int = -1
         private set
+    @Volatile @JvmStatic private var kbVisReq: Int = -1  // v0.7.2: -1=nochange, 0=hide, 1=show
+    @JvmStatic fun pollKbVisRequest(): Int { val r = kbVisReq; kbVisReq = -1; return r }
+    @JvmStatic fun requestKbVisible(v: Boolean) { kbVisReq = if (v) 1 else 0 }
     @Volatile private var externalOesTexId: Int = 0
+
+    // v0.7: keyboard OES surface — for rendering our XR keyboard bitmap
+    @Volatile private var kbOesTexId: Int = 0
+    @Volatile private var kbSurfaceTexture: android.graphics.SurfaceTexture? = null
+    @Volatile private var kbSurface: Surface? = null
     @Volatile private var vdCreatePending: Boolean = false
     private val stMatrix = FloatArray(16)
 
     @JvmStatic fun setActivity(a: Activity?) { activity = a; Log.i(TAG, "setActivity: $a") }
     @JvmStatic fun helloFromKotlin(): String = "hello from Kotlin! v0.4.3a activity=${activity != null}"
     @JvmStatic fun setExternalOesTextureId(id: Int) { externalOesTexId = id; Log.i(TAG, "setExternalOesTextureId($id)") }
+
+    @JvmStatic
+    fun setKeyboardOesTextureId(id: Int) {
+        kbOesTexId = id
+        Log.i(TAG, "setKeyboardOesTextureId($id)")
+        // Create SurfaceTexture on the OES tex id, size to keyboard bitmap dims
+        val st = android.graphics.SurfaceTexture(id).apply {
+            setDefaultBufferSize(KeyboardTexture.width(), KeyboardTexture.height())
+        }
+        kbSurfaceTexture = st
+        kbSurface = Surface(st)
+        // Initial render
+        renderKeyboardToSurface()
+    }
+
+    @JvmStatic
+    fun updateKbSurfaceTexImage(): Boolean {
+        val st = kbSurfaceTexture ?: return false
+        return try { st.updateTexImage(); true } catch (e: Throwable) { false }
+    }
+
+    private fun renderKeyboardToSurface() {
+        val surf = kbSurface ?: return
+        try {
+            val canvas = surf.lockCanvas(null)
+            // v0.7.2: clear surface to transparent first, so key-gap alpha propagates
+            canvas.drawColor(0, android.graphics.PorterDuff.Mode.CLEAR)
+            val bmp = android.graphics.Bitmap.createBitmap(KeyboardTexture.width(), KeyboardTexture.height(),
+                android.graphics.Bitmap.Config.ARGB_8888)
+            val pixels = KeyboardTexture.renderPixels()
+            bmp.copyPixelsFromBuffer(pixels)
+            canvas.drawBitmap(bmp, 0f, 0f, null)
+            bmp.recycle()
+            surf.unlockCanvasAndPost(canvas)
+        } catch (e: Throwable) { Log.e(TAG, "renderKeyboardToSurface failed", e) }
+    }
+
+    @JvmStatic
+    fun handleKeyboardHit(u: Float, v: Float) {
+        val hit = KeyboardTexture.hitKey(u, v) ?: return
+        val target = lastTappedOesDisplayId
+        Log.i(TAG, "keyboard hit u=$u v=$v key='${hit.label}' action=${hit.action} target=$target")
+        when (hit.action) {
+            // v0.7.4: modifier & state toggles — always re-render, never consume mods
+            KeyboardTexture.ACT_SHIFT, KeyboardTexture.ACT_LANG, KeyboardTexture.ACT_PAGE,
+            KeyboardTexture.ACT_EXTEND, KeyboardTexture.ACT_CTRL, KeyboardTexture.ACT_ALT,
+            KeyboardTexture.ACT_META, KeyboardTexture.ACT_CAPS -> {
+                if (KeyboardTexture.handlePress(hit)) renderKeyboardToSurface()
+                return
+            }
+            KeyboardTexture.ACT_CLOSE -> { requestKbVisible(false); return }
+        }
+        // Non-modifier key path — build metaState from active mods so chords work (Ctrl+C etc.)
+        val meta = KeyboardTexture.readMetaState()
+        val hadMods = KeyboardTexture.hasActiveMods()
+        when (hit.action) {
+            KeyboardTexture.ACT_BACKSPACE -> { if (target >= 0) injectKey(target, 67, meta) }
+            KeyboardTexture.ACT_ENTER -> { if (target >= 0) injectKey(target, 66, meta) }
+            KeyboardTexture.ACT_SPACE -> { if (target >= 0) injectKey(target, 62, meta) }
+            KeyboardTexture.ACT_ARROW_UP -> { if (target >= 0) injectKey(target, 19, meta) }
+            KeyboardTexture.ACT_ARROW_DOWN -> { if (target >= 0) injectKey(target, 20, meta) }
+            KeyboardTexture.ACT_ARROW_LEFT -> { if (target >= 0) injectKey(target, 21, meta) }
+            KeyboardTexture.ACT_ARROW_RIGHT -> { if (target >= 0) injectKey(target, 22, meta) }
+            KeyboardTexture.ACT_ESC -> { if (target >= 0) injectKey(target, 111, meta) }
+            KeyboardTexture.ACT_TAB -> { if (target >= 0) injectKey(target, 61, meta) }
+            else -> {
+                if (hit.text.isNotEmpty() && target >= 0) {
+                    // If mods are active, try mapping char->keycode and inject as KEY with metaState.
+                    // Otherwise (or if unmappable), fall back to text path (proper Unicode + no chording).
+                    val kc = if (hadMods) KeyboardTexture.charToKeycode(hit.text[0]) else -1
+                    if (kc > 0) {
+                        injectKey(target, kc, meta)
+                    } else {
+                        val ascii = hit.text.all { it.code < 128 }
+                        if (ascii) injectText(target, hit.text)
+                        else RoverImeService.commit(hit.text)
+                    }
+                }
+            }
+        }
+        // Consume one-shot mods and auto-unshift, then re-render if state changed
+        val consumed = KeyboardTexture.consumeOneShotMods()
+        val stateChanged = KeyboardTexture.handlePress(hit)
+        if (consumed || stateChanged) renderKeyboardToSurface()
+    }
+
+    // v0.7.1: hold-to-repeat — only fires for backspace + arrows (not shift/lang/page/text/enter/space)
+    @JvmStatic
+    fun handleKeyboardHold(u: Float, v: Float) {
+        val hit = KeyboardTexture.hitKey(u, v) ?: return
+        val target = lastTappedOesDisplayId
+        if (target < 0) return
+        when (hit.action) {
+            KeyboardTexture.ACT_BACKSPACE -> injectKey(target, 67)
+            KeyboardTexture.ACT_ARROW_UP -> injectKey(target, 19)
+            KeyboardTexture.ACT_ARROW_DOWN -> injectKey(target, 20)
+            KeyboardTexture.ACT_ARROW_LEFT -> injectKey(target, 21)
+            KeyboardTexture.ACT_ARROW_RIGHT -> injectKey(target, 22)
+            else -> return  // non-repeatable
+        }
+    }
 
     @JvmStatic
     fun updateSurfaceTexImage(): Boolean {
@@ -165,11 +275,20 @@ object RoverBridge {
     fun getPanelDisplayId(): Int = virtualDisplayId
 
     @JvmStatic
+    fun injectKey(displayId: Int, keycode: Int, meta: Int = 0): Boolean =
+        sendInject("KEY $displayId $keycode $meta")
+
+    @JvmStatic
+    fun injectText(displayId: Int, text: String): Boolean =
+        sendInject("TEXT $displayId $text")
+
+    @JvmStatic
     fun setDisplayImePolicy(displayId: Int, policy: Int): Boolean =
         sendInject("IME_POLICY $displayId $policy")
 
     @JvmStatic
     fun injectTap(displayId: Int, x: Int, y: Int): Boolean {
+        lastTappedOesDisplayId = displayId
         // v0.5.2: re-assert IME LOCAL policy on every tap — Meta shell keeps resetting it
         sendInject("IME_POLICY $displayId 0")
         return sendInject("TAP $displayId $x $y")
@@ -228,6 +347,7 @@ object RoverBridge {
     }
 
     private fun sendInject(cmd: String): Boolean {
+        Log.i(TAG, "sendInject: $cmd")
         if (!injectorSpawned) {
             // Kick off spawn on bg thread; drop this event, next will land
             Thread { ensureInjectorRunning() }.start()

@@ -640,6 +640,8 @@ void UpdateStageBounds(App& app) {
 #endif
 
 static GLuint g_oesTextureId = 0;
+static GLuint g_kbOesTextureId = 0;
+static int g_kbPanelIdx = -1;  // v0.7.2: tracked so buttons can toggle visibility
 
 static void CallSetupOesTexture(struct android_app* androidApp) {
     // Create OES texture in the current EGL context (called from android_main after Egl init)
@@ -672,6 +674,86 @@ static void CallSetupOesTexture(struct android_app* androidApp) {
     if (method) env->CallStaticVoidMethod(cls, method, (jint)g_oesTextureId);
     if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
     env->DeleteLocalRef(cls);
+}
+
+
+static void CallSetupKeyboardOesTexture(struct android_app* androidApp) {
+    glGenTextures(1, &g_kbOesTextureId);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, g_kbOesTextureId);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+    ALOGE("[rover] keyboard OES texture created id=%u", g_kbOesTextureId);
+    ALOGE("[rover-kb] about to JNI setKeyboardOesTextureId");
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return;
+    ALOGE("[rover-kb] bridgeCls=%p", g_bridgeCls);
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "setKeyboardOesTextureId", "(I)V");
+    ALOGE("[rover-kb] method resolved=%p", m);
+    if (!m) { env->ExceptionClear(); return; }
+    env->CallStaticVoidMethod(g_bridgeCls, m, (jint)g_kbOesTextureId);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
+static bool CallUpdateKbSurfaceTexImage(struct android_app* androidApp) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return false;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return false;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "updateKbSurfaceTexImage", "()Z");
+    if (!m) { env->ExceptionClear(); return false; }
+    jboolean r = env->CallStaticBooleanMethod(g_bridgeCls, m);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); return false; }
+    return r == JNI_TRUE;
+}
+
+static void CallHandleKeyboardHit(struct android_app* androidApp, float u, float v) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "handleKeyboardHit", "(FF)V");
+    if (!m) { env->ExceptionClear(); return; }
+    env->CallStaticVoidMethod(g_bridgeCls, m, (jfloat)u, (jfloat)v);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
+static void CallHandleKeyboardHold(struct android_app* androidApp, float u, float v) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "handleKeyboardHold", "(FF)V");
+    if (!m) { env->ExceptionClear(); return; }
+    env->CallStaticVoidMethod(g_bridgeCls, m, (jfloat)u, (jfloat)v);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
+static int CallPollKbVisRequest(struct android_app* androidApp) {
+    // -1=no change, 0=hide, 1=show
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return -1;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return -1;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "pollKbVisRequest", "()I");
+    if (!m) { env->ExceptionClear(); return -1; }
+    jint r = env->CallStaticIntMethod(g_bridgeCls, m);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); return -1; }
+    return (int)r;
 }
 
 
@@ -1410,6 +1492,7 @@ int main() {
     leftRayLine.Init(app.Session);
     // v0.4.2d1: create OES texture; v0.4.3a: also kick off VirtualDisplay creation
     CallSetupOesTexture(androidApp);
+    CallSetupKeyboardOesTexture(androidApp);
     CallEnsureVirtualDisplay(androidApp);
     static rover::OesBlitter oesBlitter;
     oesBlitter.Init();
@@ -1427,6 +1510,16 @@ int main() {
         // Red. Pose is offset from head-yaw origin: 0.6 m right, 1.5 m ahead.
         XrPosef pose2 = {{0,0,0,1}, {0.6f, 0.0f, -1.5f}};
         panelMgr.AddPanel(rover::DofMode::BodyLocked, pose2, {0.40f, 0.30f}, 0.65f, 0.25f, 0.25f, 0.85f);
+
+        // v0.7: keyboard panel — head-locked below main content. 1.2m x 0.5m at 1.5m ahead.
+        XrPosef pose3 = {{0,0,0,1}, {0.0f, -0.55f, -1.5f}};
+        int kbIdx = panelMgr.AddPanel(rover::DofMode::HeadLocked, pose3, {1.2f, 0.5f}, 0.10f, 0.10f, 0.10f, 0.95f, 1200, 500);
+        panelMgr.PanelAt(kbIdx).oesSourced = true;
+        panelMgr.PanelAt(kbIdx).oesTextureId = g_kbOesTextureId;
+        panelMgr.PanelAt(kbIdx).isKeyboard = true;
+        panelMgr.PanelAt(kbIdx).visible = false;         // v0.7.2: hidden until Right-A or Kotlin request
+        panelMgr.PanelAt(kbIdx).oesForceOpaque = false;  // v0.7.2: preserve alpha so key-gap bg is transparent
+        g_kbPanelIdx = kbIdx;
     }
 
 
@@ -1885,6 +1978,11 @@ int main() {
         static int tapPanelIdx = -1;
         static float tapStartU = 0.f, tapStartV = 0.f;  // UV (0..1, 0=top-left) at tap start
         static long tapStartTimeMs = 0;
+        // v0.7.1: keyboard hold-to-repeat (backspace, arrows)
+        static int kbHeldHand = 0;      // 0=none, 1=left, 2=right
+        static float kbHeldU = 0.f, kbHeldV = 0.f;
+        static long kbHeldStartMs = 0;
+        static long kbHeldNextFireMs = 0;
         static int resizedIdx = -1;
         static int ri_ctr = 0;
         if ((ri_ctr++ % 30) == 0) ALOGE("[rover-dbg] tick resizedIdx=%d grabbedIdx=%d", resizedIdx, grabbedIdx);
@@ -1915,6 +2013,25 @@ int main() {
                 CallLaunchAppOnDisplay(androidApp, "org.telegram.messenger.web", "org.telegram.ui.LaunchActivity");
             }
             prevLeftX = cur;
+        }
+        {
+            // v0.7.2/6: Right-A toggles keyboard panel visibility
+            static bool prevRightA = false;
+            bool cur = (rightAButtonState.type != 0 && rightAButtonState.currentState != XR_FALSE);
+            if (cur && !prevRightA && g_kbPanelIdx >= 0) {
+                bool now = !panelMgr.PanelAt(g_kbPanelIdx).visible;
+                panelMgr.PanelAt(g_kbPanelIdx).visible = now;
+                ALOGE("[rover-kb] Right-A toggle visible=%d", now?1:0);
+            }
+            prevRightA = cur;
+        }
+        {
+            // v0.7.2: Kotlin can request show/hide (close X, future focus detection)
+            int req = CallPollKbVisRequest(androidApp);
+            if (req >= 0 && g_kbPanelIdx >= 0) {
+                panelMgr.PanelAt(g_kbPanelIdx).visible = (req == 1);
+                ALOGE("[rover-kb] Kotlin req=%d -> visible=%d", req, req==1?1:0);
+            }
         }
 
         auto locateCtrl = [&](XrSpace space, bool active, XrPosef* outPose, bool* outValid) {
@@ -1951,6 +2068,32 @@ int main() {
         rover::HitResult rightHit = {-1, false, -1, 0}, leftHit = {-1, false, -1, 0};
         if (rightCtrlValid) rightHit = panelMgr.Raycast(rightCtrl.position, computeRayDir(rightCtrl.orientation), headInLocal);
         if (leftCtrlValid)  leftHit  = panelMgr.Raycast(leftCtrl.position,  computeRayDir(leftCtrl.orientation),  headInLocal);
+        {
+            // v0.7.2-diag: log on trigger press-transition so we can see what user "clicked" on
+            static bool prevL = false, prevR = false;
+            if (rightTrigger && !prevR) {
+                XrVector3f rd = computeRayDir(rightCtrl.orientation);
+                ALOGE("[rover-diag] R-TRIG orig=(%.2f,%.2f,%.2f) dir=(%.2f,%.2f,%.2f) hit=panel%d(bar=%d,corner=%d,dist=%.2f)",
+                    rightCtrl.position.x, rightCtrl.position.y, rightCtrl.position.z,
+                    rd.x, rd.y, rd.z,
+                    rightHit.panelIdx, rightHit.hitBar?1:0, rightHit.cornerIdx, rightHit.distance);
+                for (size_t pi = 0; pi < panelMgr.Panels().size(); ++pi) {
+                    const auto& pp = panelMgr.PanelAt(pi);
+                    XrPosef pw = panelMgr.ResolveWorldPose((int)pi, headInLocal);
+                    ALOGE("[rover-diag]   panel%zu vis=%d oes=%d kb=%d pos=(%.2f,%.2f,%.2f) size=(%.2f,%.2f)",
+                        pi, pp.visible?1:0, pp.oesSourced?1:0, pp.isKeyboard?1:0,
+                        pw.position.x, pw.position.y, pw.position.z, pp.size.width, pp.size.height);
+                }
+            }
+            if (leftTrigger && !prevL) {
+                XrVector3f rd = computeRayDir(leftCtrl.orientation);
+                ALOGE("[rover-diag] L-TRIG orig=(%.2f,%.2f,%.2f) dir=(%.2f,%.2f,%.2f) hit=panel%d(bar=%d,corner=%d,dist=%.2f)",
+                    leftCtrl.position.x, leftCtrl.position.y, leftCtrl.position.z,
+                    rd.x, rd.y, rd.z,
+                    leftHit.panelIdx, leftHit.hitBar?1:0, leftHit.cornerIdx, leftHit.distance);
+            }
+            prevL = leftTrigger; prevR = rightTrigger;
+        }
         if (rightHit.cornerIdx >= 0 || leftHit.cornerIdx >= 0) {
             static int hitctr = 0;
             if ((hitctr++ % 15) == 0) ALOGE("[rover-dbg] corner hit R.pi=%d R.corner=%d L.pi=%d L.corner=%d",
@@ -2108,15 +2251,28 @@ int main() {
                         float v_m = rx*axY.x + ry*axY.y + rz*axY.z;  // meters from center along panel Y (+ = up)
                         float uv_u = (u_m + 0.5f * pRef.size.width)  / pRef.size.width;   // 0=left  1=right
                         float uv_v = 1.0f - (v_m + 0.5f * pRef.size.height) / pRef.size.height;  // 0=top   1=bottom (Android UI)
-                        tapHand = hand;
-                        tapPanelIdx = useHit.panelIdx;
-                        tapStartU = uv_u;
-                        tapStartV = uv_v;
-                        tapStartTimeMs = (long)(std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now().time_since_epoch()).count());
-                        ALOGE("[rover-tap] START pi=%d hand=%d uv=(%.3f,%.3f) px=(%d,%d)",
-                            useHit.panelIdx, hand, uv_u, uv_v,
-                            (int)(uv_u * pRef.width), (int)(uv_v * pRef.height));
+                        if (pRef.isKeyboard) {
+                            // v0.7: keyboard panel — instant-fire via Kotlin dispatch, no tap-tracking.
+                            ALOGE("[rover-kb] press pi=%d uv=(%.3f,%.3f)", useHit.panelIdx, uv_u, uv_v);
+                            CallHandleKeyboardHit(androidApp, uv_u, uv_v);
+                            // v0.7.1: arm hold-to-repeat (backspace/arrows)
+                            kbHeldHand = hand;
+                            kbHeldU = uv_u;
+                            kbHeldV = uv_v;
+                            kbHeldStartMs = (long)(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count());
+                            kbHeldNextFireMs = kbHeldStartMs + 400;  // initial delay
+                        } else {
+                            tapHand = hand;
+                            tapPanelIdx = useHit.panelIdx;
+                            tapStartU = uv_u;
+                            tapStartV = uv_v;
+                            tapStartTimeMs = (long)(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count());
+                            ALOGE("[rover-tap] START pi=%d hand=%d uv=(%.3f,%.3f) px=(%d,%d)",
+                                useHit.panelIdx, hand, uv_u, uv_v,
+                                (int)(uv_u * pRef.width), (int)(uv_v * pRef.height));
+                        }
                     } else {
                         // Start MOVE (existing — solid panel or bar hit)
                         grabbedIdx = useHit.panelIdx;
@@ -2237,6 +2393,21 @@ int main() {
             }
         }
         g_prevResizedIdx = resizedIdx;
+
+        // v0.7.1: keyboard hold-to-repeat — after 400ms, fire every 60ms while held
+        if (kbHeldHand != 0) {
+            bool stillHeld = (kbHeldHand == 1) ? leftTrigger : rightTrigger;
+            if (!stillHeld) {
+                kbHeldHand = 0;
+            } else {
+                long nowKb = (long)(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+                if (nowKb >= kbHeldNextFireMs) {
+                    CallHandleKeyboardHold(androidApp, kbHeldU, kbHeldV);
+                    kbHeldNextFireMs = nowKb + 60;
+                }
+            }
+        }
 
         // v0.5.1: tap release detection — fires tap or long-press based on held duration
         if (tapHand != 0 && tapPanelIdx >= 0) {
@@ -2386,6 +2557,7 @@ int main() {
             static bool g_launchedTestApp = false;
             if (g_oesTextureId != 0) {
                 CallUpdateSurfaceTexImage(androidApp);
+            CallUpdateKbSurfaceTexImage(androidApp);
 for (int pi = 0; pi < (int)panelMgr.Panels().size(); pi++) {
                     if (panelMgr.PanelAt(pi).oesSourced) {
                         float kStMat[16]; bool haveMat = CallGetSTMatrix(androidApp, kStMat);
@@ -2398,7 +2570,10 @@ for (int pi = 0; pi < (int)panelMgr.Panels().size(); pi++) {
                                 kStMat[8],kStMat[9],kStMat[10],kStMat[11],
                                 kStMat[12],kStMat[13],kStMat[14],kStMat[15]);
                         }
-                        oesBlitter.BlitToPanel(panelMgr.PanelAt(pi), g_oesTextureId, haveMat ? kStMat : nullptr);
+                        if (!panelMgr.PanelAt(pi).visible) continue;
+                        GLuint useTex = panelMgr.PanelAt(pi).oesTextureId ? panelMgr.PanelAt(pi).oesTextureId : g_oesTextureId;
+                        const float* useStMat = haveMat ? kStMat : nullptr;
+                        oesBlitter.BlitToPanel(panelMgr.PanelAt(pi), useTex, useStMat);
                     }
                 }
             }

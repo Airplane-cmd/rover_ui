@@ -161,8 +161,10 @@ XrActionStateVector2f leftThumbState;
 XrActionStateVector2f rightThumbState;
 XrActionStateBoolean rightBButtonState;
 XrActionStateBoolean leftXButtonState;
+XrActionStateBoolean rightAButtonState;
 static XrAction captureButtonAction = XR_NULL_HANDLE;
 static XrAction leftXButtonAction = XR_NULL_HANDLE;
+static XrAction rightAButtonAction = XR_NULL_HANDLE;
 static XrAction thumbstickAction = XR_NULL_HANDLE;
 
 bool leftControllerActive = false;
@@ -199,6 +201,9 @@ void AppInput_init(App& app) {
     leftXButtonAction = CreateAction(
         runningActionSet, XR_ACTION_TYPE_BOOLEAN_INPUT, "left_x_btn", "Left X Button");
 
+    rightAButtonAction = CreateAction(
+        runningActionSet, XR_ACTION_TYPE_BOOLEAN_INPUT, "right_a_btn", "Right A Button");
+
     gripPoseAction = CreateAction(
         runningActionSet, XR_ACTION_TYPE_POSE_INPUT, "grip_pose", nullptr, 2, handSubactionPaths);
 
@@ -232,6 +237,8 @@ void AppInput_init(App& app) {
             ActionSuggestedBinding(app, captureButtonAction, "/user/hand/right/input/b/click"));
         bindings.push_back(
             ActionSuggestedBinding(app, leftXButtonAction, "/user/hand/left/input/x/click"));
+        bindings.push_back(
+            ActionSuggestedBinding(app, rightAButtonAction, "/user/hand/right/input/a/click"));
 
         XrInteractionProfileSuggestedBinding suggestedBindings = {
             XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
@@ -315,5 +322,10 @@ void AppInput_syncActions(App& app) {
         gi.subactionPath = XR_NULL_PATH;
         leftXButtonState = {XR_TYPE_ACTION_STATE_BOOLEAN};
         OXR(xrGetActionStateBoolean(app.Session, &gi, &leftXButtonState));
+
+        gi.action = rightAButtonAction;
+        gi.subactionPath = XR_NULL_PATH;
+        rightAButtonState = {XR_TYPE_ACTION_STATE_BOOLEAN};
+        OXR(xrGetActionStateBoolean(app.Session, &gi, &rightAButtonState));
     }
 }
