@@ -118,7 +118,7 @@ union CompositionLayerUnion {
     // FB_passthrough sample end
 };
 
-enum { MaxLayerCount = 16 };
+enum { MaxLayerCount = 16 };  // Meta Quest 3 runtime cap
 
 struct App {
     void Clear();

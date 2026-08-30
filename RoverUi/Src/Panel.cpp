@@ -36,6 +36,10 @@ static void FillSwapchainSolid(XrSwapchain sc, float r, float g, float b, float 
 static constexpr float BAR_HEIGHT_M = 0.012f;   // 3cm tall
 static constexpr float BAR_WIDTH_RATIO = 0.25f; // 40% of panel width
 static constexpr float BAR_GAP_M = 0.015f;      // 2cm gap between panel bottom and bar
+static constexpr float BAR_HOVER_HEIGHT_M = 0.030f; // v0.8-1b: expanded bar height on hover
+static constexpr float BAR_HOVER_WIDTH_RATIO = 1.0f;  // v0.8-1b: full panel width when hovered
+static constexpr int32_t BAR_HOVER_TEX_W = 1024;
+static constexpr int32_t BAR_HOVER_TEX_H = 64;
 static constexpr int32_t BAR_TEX_W = 64;
 static constexpr int32_t BAR_TEX_H = 16;
 static constexpr float HANDLE_SIZE_M = 0.025f;   // 2.5cm corner handle
@@ -120,7 +124,7 @@ int PanelManager::AddPanel(DofMode mode, const XrPosef& pose, const XrExtent2Df&
     p.barHovered = false;
 
     p.swapchain = CreateColorSwapchain(session_, width, height);
-    p.barSwapchain = CreateColorSwapchain(session_, BAR_TEX_W, BAR_TEX_H);
+    p.barSwapchain = CreateColorSwapchain(session_, BAR_HOVER_TEX_W, BAR_HOVER_TEX_H);  // v0.8-1b: larger so hover UI fits
 
     panels_.push_back(p);
     int idx = static_cast<int>(panels_.size()) - 1;
@@ -146,6 +150,7 @@ void PanelManager::FillBar(int panelIdx, bool hovered) {
 bool PanelManager::ResizePanelSwapchain(int panelIdx, int32_t newW, int32_t newH) {
     if (panelIdx < 0 || panelIdx >= (int)panels_.size()) return false;
     Panel& p = panels_[panelIdx];
+    if (p.width == newW && p.height == newH && p.swapchain != XR_NULL_HANDLE) return true;  // v0.8-fix: no-op
     if (p.swapchain != XR_NULL_HANDLE) {
         xrDestroySwapchain(p.swapchain);
         p.swapchain = XR_NULL_HANDLE;
@@ -328,15 +333,17 @@ HitResult PanelManager::Raycast(const XrVector3f& rayOrigin, const XrVector3f& r
         if (!p.visible) continue;
         XrPosef world = ResolveWorldPose(i, headPoseInLocal);
 
-        // bar center: below panel by (h/2 + gap + BAR_HEIGHT/2), same orientation
-        float barCenterOffsetY = -(p.size.height * 0.5f + BAR_GAP_M + BAR_HEIGHT_M * 0.5f);
+        // bar center: below panel — use hover height for hit-test so pointing at expanded region counts
+        float barCenterOffsetY = -(p.size.height * 0.5f + BAR_GAP_M + BAR_HOVER_HEIGHT_M * 0.5f);
         XrPosef barLocalOffset = {{0,0,0,1}, {0, barCenterOffsetY, 0}};
         XrPosef barWorld = PoseMul(world, barLocalOffset);
         float barW = p.size.width * BAR_WIDTH_RATIO;
 
         float t = 0;
-        // bar first (smaller, more specific target)
-        if (RayQuadHit(rayOrigin, rayDir, barWorld, barW, BAR_HEIGHT_M, &t)) {
+        // bar first — v0.8-1b: always use hover-expanded bounds so pointing near activates it
+        float barHitH = BAR_HOVER_HEIGHT_M;
+        float barHitW = p.size.width * BAR_HOVER_WIDTH_RATIO;
+        if (RayQuadHit(rayOrigin, rayDir, barWorld, barHitW, barHitH, &t)) {
             if (t < best.distance) { best = {i, true, -1, t}; }
         }
         // Also test body but only if no closer bar hit
@@ -400,18 +407,20 @@ void PanelManager::BuildLayers(XrCompositionLayerQuad* outQuads, int outCap, int
         q.size = p.size;
         q.pose = world;
     }
-    // Display bars (rendered after so they z-sort on top when overlapping)
+    // Display bars — v0.8-1b: hover-expanded, sourced from OES when available
     for (int i = 0; i < static_cast<int>(panels_.size()); i++) {
         if (count >= outCap) break;
         const Panel& p = panels_[i];
         if (!p.visible) continue;
+        if (p.isKeyboard) continue;  // v0.8-fixes-2: kb has no bar (saves layers)
         XrPosef world = ResolveWorldPose(i, headPoseInLocal);
-        float barCenterOffsetY = -(p.size.height * 0.5f + BAR_GAP_M + BAR_HEIGHT_M * 0.5f);
+        float barH = p.barHovered ? BAR_HOVER_HEIGHT_M : BAR_HEIGHT_M;
+        float barW = p.size.width * (p.barHovered ? BAR_HOVER_WIDTH_RATIO : BAR_WIDTH_RATIO);
+        float barCenterOffsetY = -(p.size.height * 0.5f + BAR_GAP_M + barH * 0.5f);
         XrPosef barLocalOffset = {{0,0,0,1}, {0, barCenterOffsetY, 0}};
         XrPosef barWorld = PoseMul(world, barLocalOffset);
         barWorld.orientation = QNorm(barWorld.orientation);
         if (!VecFinite(barWorld.position)) continue;
-        float barW = p.size.width * BAR_WIDTH_RATIO;
 
         XrCompositionLayerQuad& q = outQuads[count++];
         q = {XR_TYPE_COMPOSITION_LAYER_QUAD};
@@ -420,9 +429,9 @@ void PanelManager::BuildLayers(XrCompositionLayerQuad* outQuads, int outCap, int
         q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
         q.subImage.swapchain = p.barSwapchain;
         q.subImage.imageRect.offset = {0, 0};
-        q.subImage.imageRect.extent = {BAR_TEX_W, BAR_TEX_H};
+        q.subImage.imageRect.extent = {BAR_HOVER_TEX_W, BAR_HOVER_TEX_H};
         q.subImage.imageArrayIndex = 0;
-        q.size = {barW, BAR_HEIGHT_M};
+        q.size = {barW, barH};
         q.pose = barWorld;
     }
     // Corner handles: draw only for hovered panel to respect layer budget
@@ -677,11 +686,12 @@ static const char* kOesFragment = R"(#version 300 es
 precision mediump float;
 uniform samplerExternalOES uTex;
 uniform float uForceOpaque;  // 1.0=force alpha=1; 0.0=preserve source alpha
+uniform float uPanelAlpha;   // v0.8-1b-ii: extra alpha multiplier per panel (slider)
 in vec2 vUV;
 out vec4 outColor;
 void main() {
     vec4 c = texture(uTex, vUV);
-    float a = mix(c.a, 1.0, uForceOpaque);
+    float a = mix(c.a, 1.0, uForceOpaque) * uPanelAlpha;
     outColor = vec4(c.rgb, a);
 }
 )";
@@ -718,6 +728,7 @@ bool OesBlitter::Init() {
     uTexLoc_ = glGetUniformLocation(program_, "uTex");
     uSTMatrixLoc_ = glGetUniformLocation(program_, "uSTMatrix");
     uForceOpaqueLoc_ = glGetUniformLocation(program_, "uForceOpaque");
+    uPanelAlphaLoc_ = glGetUniformLocation(program_, "uPanelAlpha");
 
     // Fullscreen triangle strip (2 triangles)
     static const float verts[] = { -1,-1,  1,-1,  -1,1,  1,1 };
@@ -778,6 +789,7 @@ bool OesBlitter::BlitToPanel(Panel& p, unsigned int oesTexId, const float* stMat
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, oesTexId);
     glUniform1i(uTexLoc_, 0);
     glUniform1f(uForceOpaqueLoc_, p.oesForceOpaque ? 1.0f : 0.0f);
+        glUniform1f(uPanelAlphaLoc_, p.panelAlpha);
     static const float kIdentity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
     const float* mat = stMatrix4x4 ? stMatrix4x4 : kIdentity;
     if (uSTMatrixLoc_ >= 0) glUniformMatrix4fv(uSTMatrixLoc_, 1, GL_FALSE, mat);
@@ -791,6 +803,61 @@ bool OesBlitter::BlitToPanel(Panel& p, unsigned int oesTexId, const float* stMat
 
     XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     OXR(xrReleaseSwapchainImage(p.swapchain, &ri));
+    delete[] imgs;
+    return true;
+}
+
+// v0.8-1b: blit OES tex into p.barSwapchain (uses hover-expanded pixel dims)
+bool OesBlitter::BlitToBar(Panel& p, unsigned int oesTexId, const float* stMatrix4x4) {
+    if (!ready_ || oesTexId == 0) return false;
+    if (p.barSwapchain == XR_NULL_HANDLE) return false;
+
+    unsigned int len = 0;
+    OXR(xrEnumerateSwapchainImages(p.barSwapchain, 0, &len, nullptr));
+    auto* imgs = new XrSwapchainImageOpenGLESKHR[len];
+    for (unsigned int i = 0; i < len; i++) imgs[i] = {XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR};
+    OXR(xrEnumerateSwapchainImages(p.barSwapchain, len, &len,
+        reinterpret_cast<XrSwapchainImageBaseHeader*>(imgs)));
+    uint32_t idx = 0;
+    XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    OXR(xrAcquireSwapchainImage(p.barSwapchain, &ai, &idx));
+    XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = XR_INFINITE_DURATION;
+    OXR(xrWaitSwapchainImage(p.barSwapchain, &wi));
+
+    GLuint fbo = 0;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                            static_cast<GLuint>(imgs[idx].image), 0);
+
+    glViewport(0, 0, BAR_HOVER_TEX_W, BAR_HOVER_TEX_H);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glClearColor(0, 0, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glUseProgram(program_);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, oesTexId);
+    glUniform1i(uTexLoc_, 0);
+    glUniform1f(uForceOpaqueLoc_, 0.0f);
+    glUniform1f(uPanelAlphaLoc_, 1.0f);  // bar not affected by panel alpha slider
+    if (stMatrix4x4) glUniformMatrix4fv(uSTMatrixLoc_, 1, GL_FALSE, stMatrix4x4);
+    else {
+        float ident[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+        glUniformMatrix4fv(uSTMatrixLoc_, 1, GL_FALSE, ident);
+    }
+
+    glBindVertexArray(vao_);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glBindVertexArray(0);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDeleteFramebuffers(1, &fbo);
+
+    XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    OXR(xrReleaseSwapchainImage(p.barSwapchain, &ri));
     delete[] imgs;
     return true;
 }

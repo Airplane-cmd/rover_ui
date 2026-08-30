@@ -37,6 +37,255 @@ object RoverBridge {
     @Volatile @JvmStatic private var kbVisReq: Int = -1  // v0.7.2: -1=nochange, 0=hide, 1=show
     @JvmStatic fun pollKbVisRequest(): Int { val r = kbVisReq; kbVisReq = -1; return r }
     @JvmStatic fun requestKbVisible(v: Boolean) { kbVisReq = if (v) 1 else 0 }
+
+    // ============ v0.8-1a: multi-VD hosted apps ============
+    data class HostedApp(
+        val panelIdx: Int,
+        val vdId: Int,
+        val vd: android.hardware.display.VirtualDisplay,
+        val surface: Surface,
+        val st: android.graphics.SurfaceTexture,
+        val oesTexId: Int,
+        val pkg: String,
+        val activity: String
+    )
+    @JvmStatic private val hostedApps = java.util.concurrent.CopyOnWriteArrayList<HostedApp>()
+
+    @Volatile private var pendingSpawnPkgAct: String? = null
+    @Volatile private var pendingCloseIdx: Int = -1
+
+    /** Kotlin/BroadcastReceiver-side entry: request a new hosted-app window. */
+    @JvmStatic fun requestSpawn(pkg: String, activity: String) {
+        Log.i(TAG, "requestSpawn $pkg/$activity queued")
+        pendingSpawnPkgAct = "$pkg|$activity"
+    }
+
+    /** Native polls each frame. Returns "pkg|activity" if a spawn is queued, else null. */
+    @JvmStatic fun pollSpawnRequest(): String? {
+        val r = pendingSpawnPkgAct
+        pendingSpawnPkgAct = null
+        return r
+    }
+
+    /** Native polls each frame. Returns panelIdx to close, or -1. */
+    @JvmStatic fun pollCloseRequest(): Int {
+        val r = pendingCloseIdx
+        pendingCloseIdx = -1
+        return r
+    }
+
+    /** Kotlin-side entry to close a hosted app. */
+    @JvmStatic fun requestClose(panelIdx: Int) {
+        Log.i(TAG, "requestClose panel=$panelIdx queued")
+        pendingCloseIdx = panelIdx
+    }
+
+    /**
+     * Called by native AFTER it has created a new OES tex and added a panel.
+     * Kotlin now creates the SurfaceTexture on that tex, wraps it in a Surface,
+     * creates a VirtualDisplay of matching dims, and launches the app into it.
+     */
+    @JvmStatic
+    fun onPanelSpawnedNative(panelIdx: Int, oesTexId: Int, pkgActivity: String, w: Int, h: Int) {
+        val a = activity ?: run { Log.w(TAG, "onPanelSpawnedNative: no activity"); return }
+        val parts = pkgActivity.split("|", limit = 2)
+        if (parts.size != 2) { Log.w(TAG, "bad pkgActivity: $pkgActivity"); return }
+        val (pkg, act) = parts
+        a.runOnUiThread {
+            try {
+                val st = android.graphics.SurfaceTexture(oesTexId).also {
+                    it.setDefaultBufferSize(w, h)
+                }
+                val surf = Surface(st)
+                val dm = a.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+                val flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
+                            DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION or
+                            DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
+                val vd = dm.createVirtualDisplay("rover-panel-$panelIdx", w, h, VD_DPI, surf, flags)
+                val vdid = vd.display?.displayId ?: -1
+                Log.i(TAG, "spawned panel=$panelIdx vd=$vdid tex=$oesTexId for $pkg")
+                hostedApps.add(HostedApp(panelIdx, vdid, vd, surf, st, oesTexId, pkg, act))
+                Thread { ensureInjectorRunning(); setDisplayImePolicy(vdid, 0) }.start()
+                launchAppOnDisplay(pkg, act, vdid)
+            } catch (e: Throwable) {
+                Log.e(TAG, "onPanelSpawnedNative failed", e)
+            }
+        }
+    }
+
+    /** Iterate all hosted-app SurfaceTextures and updateTexImage. Called from GL thread. */
+    @JvmStatic
+    fun updateAllHostedTexImages() {
+        for (h in hostedApps) {
+            try { h.st.updateTexImage() } catch (_: Throwable) { }
+        }
+    }
+
+    /** Kotlin-side cleanup after native has removed a panel. Releases VD/surface. */
+    @JvmStatic
+    fun onPanelClosedNative(panelIdx: Int) {
+        val app = hostedApps.firstOrNull { it.panelIdx == panelIdx } ?: return
+        try {
+            Runtime.getRuntime().exec(arrayOf("su", "-c", "am force-stop ${app.pkg}"))
+        } catch (_: Throwable) { }
+        try { app.vd.release() } catch (_: Throwable) { }
+        try { app.surface.release() } catch (_: Throwable) { }
+        try { app.st.release() } catch (_: Throwable) { }
+        hostedApps.remove(app)
+        Log.i(TAG, "closed panel=$panelIdx (${app.pkg})")
+    }
+
+    /** For native placement: returns the current hosted app count. */
+    @JvmStatic fun hostedAppCount(): Int = hostedApps.size
+
+    /** Resize the underlying VD + surface buffer for a spawned panel. */
+    @JvmStatic
+    fun resizeHostedApp(panelIdx: Int, width: Int, height: Int, dpi: Int) {
+        val app = hostedApps.firstOrNull { it.panelIdx == panelIdx } ?: return
+        val a = activity ?: return
+        a.runOnUiThread {
+            try {
+                app.vd.resize(width, height, dpi)
+                app.st.setDefaultBufferSize(width, height)
+                Log.i(TAG, "resizeHostedApp panel=$panelIdx -> ${width}x$height @${dpi}dpi")
+            } catch (e: Throwable) {
+                Log.e(TAG, "resizeHostedApp failed", e)
+            }
+        }
+    }
+
+    /** Look up a hosted panel's VD id. Panel 0 = primary VD; others = from hostedApps. */
+    @JvmStatic
+    fun panelIdxToDisplayId(panelIdx: Int): Int {
+        if (panelIdx == 0 && virtualDisplayId >= 0) return virtualDisplayId
+        val app = hostedApps.firstOrNull { it.panelIdx == panelIdx } ?: return -1
+        return app.vdId
+    }
+
+    /** Get the SurfaceTexture transform matrix for a specific panel. Returns true on success. */
+    @JvmStatic
+    fun getStMatrixForPanel(panelIdx: Int, out: FloatArray): Boolean {
+        if (out.size < 16) return false
+        // Check keyboard first — kb often is panelIdx 0 now that default panel is gone
+        if (panelIdx == kbPanelIdx) {
+            val st = kbSurfaceTexture
+            if (st != null) { st.getTransformMatrix(out); return true }
+        }
+        if (panelIdx == 0) {
+            val st = surfaceTexture
+            if (st != null) { st.getTransformMatrix(out); return true }
+        }
+        val app = hostedApps.firstOrNull { it.panelIdx == panelIdx } ?: return false
+        app.st.getTransformMatrix(out)
+        return true
+    }
+
+    /** Get the transform matrix for a panel's bar SurfaceTexture. */
+    @JvmStatic
+    fun getBarStMatrix(panelIdx: Int, out: FloatArray): Boolean {
+        if (out.size < 16) return false
+        val bar = bars[panelIdx] ?: return false
+        bar.st.getTransformMatrix(out)
+        return true
+    }
+
+    // ============ v0.8-1b: per-panel action bar ============
+    private data class BarState(
+        val panelIdx: Int,
+        val oesTexId: Int,
+        val st: android.graphics.SurfaceTexture,
+        val surface: Surface,
+        var appName: String,
+        var hovered: Boolean = false,
+        var alpha: Float = 1.0f,
+        var dofIdx: Int = 0
+    )
+    private val bars = java.util.concurrent.ConcurrentHashMap<Int, BarState>()
+    private val DOF_LABELS = arrayOf("H", "Y", "B", "W")  // HeadLocked, YawLocked, BodyLocked, WorldAnchored
+
+    @JvmStatic
+    fun setBarOesTextureId(panelIdx: Int, oesTexId: Int, pkg: String, w: Int, h: Int) {
+        val a = activity ?: return
+        val label = try {
+            val pm = a.packageManager
+            val ai = pm.getApplicationInfo(pkg, 0)
+            pm.getApplicationLabel(ai).toString()
+        } catch (_: Throwable) { pkg }
+        a.runOnUiThread {
+            val st = android.graphics.SurfaceTexture(oesTexId).apply {
+                setDefaultBufferSize(w, h)
+            }
+            val sf = Surface(st)
+            val bar = BarState(panelIdx, oesTexId, st, sf, label)
+            bars[panelIdx] = bar
+            renderBarSurface(bar)
+        }
+    }
+
+    @JvmStatic
+    fun notifyBarHover(panelIdx: Int, hovered: Boolean) {
+        val bar = bars[panelIdx] ?: return
+        if (bar.hovered == hovered) return
+        bar.hovered = hovered
+        renderBarSurface(bar)
+    }
+
+    @JvmStatic
+    fun updateAllBarTexImages() {
+        for (b in bars.values) {
+            try { b.st.updateTexImage() } catch (_: Throwable) { }
+        }
+    }
+
+    /** Sub-hit for buttons/slider in hover mode. Returns action code (see BarTexture). */
+    @JvmStatic
+    fun handleBarHit(panelIdx: Int, u: Float, v: Float): Int {
+        val bar = bars[panelIdx] ?: return 0
+        if (!bar.hovered) return 0  // only route sub-hits when expanded
+        val act = BarTexture.hitAction(u)
+        when (act) {
+            1 -> {
+                Log.i(TAG, "bar close pi=$panelIdx")
+                requestClose(panelIdx)
+            }
+            2 -> {
+                Log.i(TAG, "bar hide pi=$panelIdx (TODO: actual hide)")
+                // Hide would set panel.visible=false from native side; wire in 1b-ii
+            }
+            3 -> {
+                bar.dofIdx = (bar.dofIdx + 1) % DOF_LABELS.size
+                Log.i(TAG, "bar dof pi=$panelIdx -> ${DOF_LABELS[bar.dofIdx]} (TODO: apply)")
+                renderBarSurface(bar)
+            }
+            4 -> {
+                // Slider grab; native tracks the drag
+            }
+        }
+        return act
+    }
+
+    @JvmStatic
+    fun updateBarSlider(panelIdx: Int, value: Float) {
+        val bar = bars[panelIdx] ?: return
+        bar.alpha = value
+        renderBarSurface(bar)
+        // TODO: propagate to panel alpha uniform (native shader)
+    }
+
+    private fun renderBarSurface(bar: BarState) {
+        try {
+            val canvas = bar.surface.lockCanvas(null)
+            canvas.drawColor(0, android.graphics.PorterDuff.Mode.CLEAR)
+            val bmp = android.graphics.Bitmap.createBitmap(BarTexture.W, BarTexture.H,
+                android.graphics.Bitmap.Config.ARGB_8888)
+            val pixels = BarTexture.render(bar.hovered, bar.appName, bar.alpha, DOF_LABELS[bar.dofIdx])
+            bmp.copyPixelsFromBuffer(pixels)
+            canvas.drawBitmap(bmp, 0f, 0f, null)
+            bmp.recycle()
+            bar.surface.unlockCanvasAndPost(canvas)
+        } catch (e: Throwable) { Log.e(TAG, "renderBarSurface failed", e) }
+    }
+
     @Volatile private var externalOesTexId: Int = 0
 
     // v0.7: keyboard OES surface — for rendering our XR keyboard bitmap
@@ -50,6 +299,8 @@ object RoverBridge {
     @JvmStatic fun helloFromKotlin(): String = "hello from Kotlin! v0.4.3a activity=${activity != null}"
     @JvmStatic fun setExternalOesTextureId(id: Int) { externalOesTexId = id; Log.i(TAG, "setExternalOesTextureId($id)") }
 
+    @Volatile @JvmStatic var kbPanelIdx: Int = -1  // v0.8-fixes: tracked for per-panel STMatrix
+    @JvmStatic fun setKeyboardPanelIdx(idx: Int) { kbPanelIdx = idx }
     @JvmStatic
     fun setKeyboardOesTextureId(id: Int) {
         kbOesTexId = id

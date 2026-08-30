@@ -641,7 +641,9 @@ void UpdateStageBounds(App& app) {
 
 static GLuint g_oesTextureId = 0;
 static GLuint g_kbOesTextureId = 0;
-static int g_kbPanelIdx = -1;  // v0.7.2: tracked so buttons can toggle visibility
+static int g_kbPanelIdx = -1;
+static int g_sliderPanelIdx = -1;
+static int g_sliderHand = 0;  // v0.8-1b: bar-slider drag state  // v0.7.2: tracked so buttons can toggle visibility
 
 static void CallSetupOesTexture(struct android_app* androidApp) {
     // Create OES texture in the current EGL context (called from android_main after Egl init)
@@ -754,6 +756,156 @@ static int CallPollKbVisRequest(struct android_app* androidApp) {
     jint r = env->CallStaticIntMethod(g_bridgeCls, m);
     if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); return -1; }
     return (int)r;
+}
+
+// v0.8-1a: multi-VD JNI helpers
+static std::string CallPollSpawnRequest(struct android_app* androidApp) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return "";
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return "";
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "pollSpawnRequest", "()Ljava/lang/String;");
+    if (!m) { env->ExceptionClear(); return ""; }
+    jstring js = (jstring)env->CallStaticObjectMethod(g_bridgeCls, m);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); return ""; }
+    if (!js) return "";
+    const char* c = env->GetStringUTFChars(js, nullptr);
+    std::string out = c ? c : "";
+    if (c) env->ReleaseStringUTFChars(js, c);
+    env->DeleteLocalRef(js);
+    return out;
+}
+
+static int CallPollCloseRequest(struct android_app* androidApp) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return -1;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return -1;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "pollCloseRequest", "()I");
+    if (!m) { env->ExceptionClear(); return -1; }
+    jint r = env->CallStaticIntMethod(g_bridgeCls, m);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); return -1; }
+    return (int)r;
+}
+
+static void CallOnPanelSpawnedNative(struct android_app* androidApp, int panelIdx, int oesTexId,
+                                     const char* pkgActivity, int w, int h) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "onPanelSpawnedNative",
+        "(IILjava/lang/String;II)V");
+    if (!m) { env->ExceptionClear(); return; }
+    jstring js = env->NewStringUTF(pkgActivity);
+    env->CallStaticVoidMethod(g_bridgeCls, m, (jint)panelIdx, (jint)oesTexId, js, (jint)w, (jint)h);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+    env->DeleteLocalRef(js);
+}
+
+static void CallOnPanelClosedNative(struct android_app* androidApp, int panelIdx) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "onPanelClosedNative", "(I)V");
+    if (!m) { env->ExceptionClear(); return; }
+    env->CallStaticVoidMethod(g_bridgeCls, m, (jint)panelIdx);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
+static void CallUpdateAllHostedTexImages(struct android_app* androidApp) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "updateAllHostedTexImages", "()V");
+    if (!m) { env->ExceptionClear(); return; }
+    env->CallStaticVoidMethod(g_bridgeCls, m);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
+// v0.8-1b: bar rendering + hover state
+static void CallSetBarOesTextureId(struct android_app* androidApp, int panelIdx, int texId,
+                                    const char* pkg, int w, int h) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "setBarOesTextureId",
+        "(IILjava/lang/String;II)V");
+    if (!m) { env->ExceptionClear(); return; }
+    jstring jp = env->NewStringUTF(pkg ? pkg : "");
+    env->CallStaticVoidMethod(g_bridgeCls, m, (jint)panelIdx, (jint)texId, jp, (jint)w, (jint)h);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+    env->DeleteLocalRef(jp);
+}
+
+static void CallNotifyBarHover(struct android_app* androidApp, int panelIdx, bool hovered) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "notifyBarHover", "(IZ)V");
+    if (!m) { env->ExceptionClear(); return; }
+    env->CallStaticVoidMethod(g_bridgeCls, m, (jint)panelIdx, (jboolean)(hovered?1:0));
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
+static void CallUpdateAllBarTexImages(struct android_app* androidApp) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "updateAllBarTexImages", "()V");
+    if (!m) { env->ExceptionClear(); return; }
+    env->CallStaticVoidMethod(g_bridgeCls, m);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
+// Returns action code: -1=none, 0=drag (default), 1=close, 2=hide, 3=dof, 4=slider
+static int CallHandleBarHit(struct android_app* androidApp, int panelIdx, float u, float v) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return -1;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return -1;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "handleBarHit", "(IFF)I");
+    if (!m) { env->ExceptionClear(); return -1; }
+    jint r = env->CallStaticIntMethod(g_bridgeCls, m, (jint)panelIdx, (jfloat)u, (jfloat)v);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); return -1; }
+    return (int)r;
+}
+
+// Called by native while a bar slider is being dragged: passes new value 0..1
+static void CallUpdateBarSlider(struct android_app* androidApp, int panelIdx, float value) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "updateBarSlider", "(IF)V");
+    if (!m) { env->ExceptionClear(); return; }
+    env->CallStaticVoidMethod(g_bridgeCls, m, (jint)panelIdx, (jfloat)value);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
 }
 
 
@@ -915,6 +1067,20 @@ static void CallResizeVirtualDisplay(struct android_app* androidApp, int w, int 
     if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
 }
 
+// v0.8-fix-reflow: per-panel VD resize
+static void CallResizeHostedApp(struct android_app* androidApp, int panelIdx, int w, int h, int dpi) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "resizeHostedApp", "(IIII)V");
+    if (!m) { env->ExceptionClear(); return; }
+    env->CallStaticVoidMethod(g_bridgeCls, m, (jint)panelIdx, (jint)w, (jint)h, (jint)dpi);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
 
 // v0.5.1: input injection helpers — shell out to "input" via su
 static int CallGetPanelDisplayId(struct android_app* androidApp) {
@@ -929,6 +1095,56 @@ static int CallGetPanelDisplayId(struct android_app* androidApp) {
     jint r = env->CallStaticIntMethod(g_bridgeCls, m);
     if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); return -1; }
     return (int)r;
+}
+
+// v0.8-1b-fix: per-panel display id lookup
+static int CallPanelIdxToDisplayId(struct android_app* androidApp, int panelIdx) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return -1;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return -1;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "panelIdxToDisplayId", "(I)I");
+    if (!m) { env->ExceptionClear(); return -1; }
+    jint r = env->CallStaticIntMethod(g_bridgeCls, m, (jint)panelIdx);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); return -1; }
+    return (int)r;
+}
+
+// v0.8-1b-fix: per-panel STMatrix lookup
+static bool CallGetSTMatrixForPanel(struct android_app* androidApp, int panelIdx, float out[16]) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return false;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return false;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "getStMatrixForPanel", "(I[F)Z");
+    if (!m) { env->ExceptionClear(); return false; }
+    jfloatArray arr = env->NewFloatArray(16);
+    jboolean r = env->CallStaticBooleanMethod(g_bridgeCls, m, (jint)panelIdx, arr);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); env->DeleteLocalRef(arr); return false; }
+    if (r) env->GetFloatArrayRegion(arr, 0, 16, out);
+    env->DeleteLocalRef(arr);
+    return r == JNI_TRUE;
+}
+
+static bool CallGetBarSTMatrix(struct android_app* androidApp, int panelIdx, float out[16]) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return false;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return false;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "getBarStMatrix", "(I[F)Z");
+    if (!m) { env->ExceptionClear(); return false; }
+    jfloatArray arr = env->NewFloatArray(16);
+    jboolean r = env->CallStaticBooleanMethod(g_bridgeCls, m, (jint)panelIdx, arr);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); env->DeleteLocalRef(arr); return false; }
+    if (r) env->GetFloatArrayRegion(arr, 0, 16, out);
+    env->DeleteLocalRef(arr);
+    return r == JNI_TRUE;
 }
 
 static void CallInjectTap(struct android_app* androidApp, int displayId, int x, int y) {
@@ -1491,25 +1707,24 @@ int main() {
     static rover::RayLine leftRayLine;
     leftRayLine.Init(app.Session);
     // v0.4.2d1: create OES texture; v0.4.3a: also kick off VirtualDisplay creation
-    CallSetupOesTexture(androidApp);
+    // v0.8-fix: primary OES tex not needed (no default panel)
     CallSetupKeyboardOesTexture(androidApp);
-    CallEnsureVirtualDisplay(androidApp);
+    // v0.8-fix: primary VD not needed (no default panel)
     static rover::OesBlitter oesBlitter;
     oesBlitter.Init();
     {
-        // Center panel: 0DoF (head-locked). Blue-ish. 40x30 cm at 1.5 m ahead.
-        XrPosef pose0 = {{0,0,0,1}, {0.0f, 0.0f, -1.5f}};
-        panelMgr.AddPanel(rover::DofMode::HeadLocked, pose0, {1.024f, 0.640f}, 0.15f, 0.35f, 0.60f, 0.85f, 1843, 1152);
-        panelMgr.PanelAt(0).oesSourced = true;
+        // v0.8-fix: no default panel — rover starts empty, user spawns apps via Right-B/Left-X (later: launcher)
 
         // Left panel: 6DoF (world-anchored). Green. 40x30 cm at 1.5 m ahead + 0.6 m left.
         XrPosef pose1 = {{0,0,0,1}, {-0.6f, 0.0f, -1.5f}};
-        panelMgr.AddPanel(rover::DofMode::WorldAnchored, pose1, {0.40f, 0.30f}, 0.20f, 0.55f, 0.25f, 0.85f);
+        // v0.8-fixes-2: dropped side placeholder panel (layer budget)
+        // panelMgr.AddPanel(rover::DofMode::WorldAnchored, pose1, {0.40f, 0.30f}, 0.20f, 0.55f, 0.25f, 0.85f);
 
         // Right panel: 3DoF (yaw-locked, rotates with head yaw but stays put on pitch/roll/translation-drift).
         // Red. Pose is offset from head-yaw origin: 0.6 m right, 1.5 m ahead.
         XrPosef pose2 = {{0,0,0,1}, {0.6f, 0.0f, -1.5f}};
-        panelMgr.AddPanel(rover::DofMode::BodyLocked, pose2, {0.40f, 0.30f}, 0.65f, 0.25f, 0.25f, 0.85f);
+        // v0.8-fixes-2: dropped side placeholder panel (layer budget)
+        // panelMgr.AddPanel(rover::DofMode::BodyLocked, pose2, {0.40f, 0.30f}, 0.65f, 0.25f, 0.25f, 0.85f);
 
         // v0.7: keyboard panel — head-locked below main content. 1.2m x 0.5m at 1.5m ahead.
         XrPosef pose3 = {{0,0,0,1}, {0.0f, -0.55f, -1.5f}};
@@ -1517,9 +1732,24 @@ int main() {
         panelMgr.PanelAt(kbIdx).oesSourced = true;
         panelMgr.PanelAt(kbIdx).oesTextureId = g_kbOesTextureId;
         panelMgr.PanelAt(kbIdx).isKeyboard = true;
-        panelMgr.PanelAt(kbIdx).visible = false;         // v0.7.2: hidden until Right-A or Kotlin request
+        panelMgr.PanelAt(kbIdx).visible = false;         // hidden until Right-A press
         panelMgr.PanelAt(kbIdx).oesForceOpaque = false;  // v0.7.2: preserve alpha so key-gap bg is transparent
         g_kbPanelIdx = kbIdx;
+        {
+            // v0.8-fixes: tell Kotlin the keyboard's panelIdx so it can return its STMatrix
+            JavaVM* jvm = androidApp->activity->vm; JNIEnv* env = nullptr;
+            jvm->AttachCurrentThread(&env, nullptr);
+            if (env) {
+                CacheBridgeClass(androidApp, env);
+                if (g_bridgeCls) {
+                    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "setKeyboardPanelIdx", "(I)V");
+                    if (m) {
+                        env->CallStaticVoidMethod(g_bridgeCls, m, (jint)kbIdx);
+                        if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+                    } else env->ExceptionClear();
+                }
+            }
+        }
     }
 
 
@@ -1998,9 +2228,24 @@ int main() {
         {
             bool cur = (rightBButtonState.type != 0 && rightBButtonState.currentState != XR_FALSE);
             if (cur && !prevCaptureBtn) {
-                ALOGE("[rover] Right B pressed — launch Termux into VD");
-                CallEnsureVirtualDisplay(androidApp);
-                CallLaunchAppOnDisplay(androidApp, "com.termux", "com.termux.app.TermuxActivity");
+                ALOGE("[rover] Right B pressed — request spawn Termux (multi-VD)");
+                // v0.8-1a: use spawn API to create a NEW hosted window each press
+                JavaVM* jvm = androidApp->activity->vm; JNIEnv* env = nullptr;
+                jvm->AttachCurrentThread(&env, nullptr);
+                if (env) {
+                    CacheBridgeClass(androidApp, env);
+                    if (g_bridgeCls) {
+                        jmethodID m = env->GetStaticMethodID(g_bridgeCls, "requestSpawn",
+                            "(Ljava/lang/String;Ljava/lang/String;)V");
+                        if (m) {
+                            jstring jp = env->NewStringUTF("com.termux");
+                            jstring ja = env->NewStringUTF("com.termux.app.TermuxActivity");
+                            env->CallStaticVoidMethod(g_bridgeCls, m, jp, ja);
+                            if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+                            env->DeleteLocalRef(jp); env->DeleteLocalRef(ja);
+                        } else { env->ExceptionClear(); }
+                    }
+                }
             }
             prevCaptureBtn = cur;
         }
@@ -2008,9 +2253,23 @@ int main() {
             static bool prevLeftX = false;
             bool cur = (leftXButtonState.type != 0 && leftXButtonState.currentState != XR_FALSE);
             if (cur && !prevLeftX) {
-                ALOGE("[rover] Left X pressed — launch Telegram into VD");
-                CallEnsureVirtualDisplay(androidApp);
-                CallLaunchAppOnDisplay(androidApp, "org.telegram.messenger.web", "org.telegram.ui.LaunchActivity");
+                ALOGE("[rover] Left X pressed — request spawn Telegram (multi-VD)");
+                JavaVM* jvm = androidApp->activity->vm; JNIEnv* env = nullptr;
+                jvm->AttachCurrentThread(&env, nullptr);
+                if (env) {
+                    CacheBridgeClass(androidApp, env);
+                    if (g_bridgeCls) {
+                        jmethodID m = env->GetStaticMethodID(g_bridgeCls, "requestSpawn",
+                            "(Ljava/lang/String;Ljava/lang/String;)V");
+                        if (m) {
+                            jstring jp = env->NewStringUTF("org.telegram.messenger.web");
+                            jstring ja = env->NewStringUTF("org.telegram.ui.LaunchActivity");
+                            env->CallStaticVoidMethod(g_bridgeCls, m, jp, ja);
+                            if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+                            env->DeleteLocalRef(jp); env->DeleteLocalRef(ja);
+                        } else { env->ExceptionClear(); }
+                    }
+                }
             }
             prevLeftX = cur;
         }
@@ -2031,6 +2290,71 @@ int main() {
             if (req >= 0 && g_kbPanelIdx >= 0) {
                 panelMgr.PanelAt(g_kbPanelIdx).visible = (req == 1);
                 ALOGE("[rover-kb] Kotlin req=%d -> visible=%d", req, req==1?1:0);
+            }
+        }
+        {
+            // v0.8-1a: process pending spawn — create OES tex, add panel, notify Kotlin
+            std::string pa = CallPollSpawnRequest(androidApp);
+            if (!pa.empty()) {
+                GLuint newTex = 0;
+                glGenTextures(1, &newTex);
+                glBindTexture(GL_TEXTURE_EXTERNAL_OES, newTex);
+                glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+
+                // Placement: head-relative offset -> world pose captured at spawn time,
+                // so BodyLocked panels keep their orientation once placed.
+                static float g_spawnCursorX = -0.6f;
+                g_spawnCursorX += 0.8f;
+                auto qrotV = [](const XrQuaternionf& q, XrVector3f v) {
+                    float x=q.x,y=q.y,z=q.z,w=q.w;
+                    float ix =  w*v.x + y*v.z - z*v.y;
+                    float iy =  w*v.y + z*v.x - x*v.z;
+                    float iz =  w*v.z + x*v.y - y*v.x;
+                    float iw = -x*v.x - y*v.y - z*v.z;
+                    return XrVector3f{
+                        ix*w + iw*-x + iy*-z - iz*-y,
+                        iy*w + iw*-y + iz*-x - ix*-z,
+                        iz*w + iw*-z + ix*-y - iy*-x
+                    };
+                };
+                XrVector3f headRelOffset = {g_spawnCursorX, 0.0f, -1.5f};
+                XrVector3f worldOffset = qrotV(headInLocal.orientation, headRelOffset);
+                XrPosef spawnPose = {headInLocal.orientation, worldOffset};
+                int w = 900, h = 600;
+                int newIdx = panelMgr.AddPanel(rover::DofMode::BodyLocked, spawnPose,
+                    {0.9f, 0.6f}, 0.10f, 0.10f, 0.10f, 1.0f, w, h);
+                panelMgr.PanelAt(newIdx).oesSourced = true;
+                panelMgr.PanelAt(newIdx).oesTextureId = newTex;
+                panelMgr.PanelAt(newIdx).oesForceOpaque = true;
+                ALOGE("[rover-spawn] panel=%d oesTex=%u pkgAct=%s", newIdx, newTex, pa.c_str());
+                CallOnPanelSpawnedNative(androidApp, newIdx, (int)newTex, pa.c_str(), w, h);
+                // v0.8-1b: also create bar OES tex for this panel
+                GLuint barTex = 0;
+                glGenTextures(1, &barTex);
+                glBindTexture(GL_TEXTURE_EXTERNAL_OES, barTex);
+                glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+                panelMgr.PanelAt(newIdx).barOesTexId = barTex;
+                // extract pkg from "pkg|activity"
+                std::string pkgOnly = pa.substr(0, pa.find('|'));
+                CallSetBarOesTextureId(androidApp, newIdx, (int)barTex, pkgOnly.c_str(), 1024, 64);
+            }
+            int closeIdx = CallPollCloseRequest(androidApp);
+            if (closeIdx >= 0) {
+                // For now: just mark invisible + notify Kotlin to release resources.
+                // (True panel removal from panelMgr is TODO — would shift indices.)
+                if (closeIdx < (int)panelMgr.Panels().size()) {
+                    panelMgr.PanelAt(closeIdx).visible = false;
+                }
+                CallOnPanelClosedNative(androidApp, closeIdx);
+                ALOGE("[rover-close] panel=%d hidden + Kotlin notified", closeIdx);
             }
         }
 
@@ -2066,8 +2390,57 @@ int main() {
             return r;
         };
         rover::HitResult rightHit = {-1, false, -1, 0}, leftHit = {-1, false, -1, 0};
+        // v0.8-fix-dof: initialize BodyLocked panels' pose from current head on first frame
+        {
+            auto qmul = [](const XrQuaternionf& a, const XrQuaternionf& b) {
+                return XrQuaternionf{
+                    a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+                    a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+                    a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
+                    a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z
+                };
+            };
+            auto qrotVec = [](const XrQuaternionf& q, XrVector3f v) {
+                float x=q.x,y=q.y,z=q.z,w=q.w;
+                float ix =  w*v.x + y*v.z - z*v.y;
+                float iy =  w*v.y + z*v.x - x*v.z;
+                float iz =  w*v.z + x*v.y - y*v.x;
+                float iw = -x*v.x - y*v.y - z*v.z;
+                return XrVector3f{
+                    ix*w + iw*-x + iy*-z - iz*-y,
+                    iy*w + iw*-y + iz*-x - ix*-z,
+                    iz*w + iw*-z + ix*-y - iy*-x
+                };
+            };
+            for (size_t pi = 0; pi < panelMgr.Panels().size(); ++pi) {
+                auto& pp = panelMgr.PanelAt((int)pi);
+                if (!pp.pendingHeadAlign) continue;
+                // Take p.pose (currently a head-relative offset) and rebase into world.
+                XrVector3f worldOffset = qrotVec(headInLocal.orientation, pp.pose.position);
+                pp.pose.position = worldOffset;
+                pp.pose.orientation = qmul(headInLocal.orientation, pp.pose.orientation);
+                pp.pendingHeadAlign = false;
+                ALOGE("[rover-dof] panel=%zu head-aligned pose", pi);
+            }
+        }
         if (rightCtrlValid) rightHit = panelMgr.Raycast(rightCtrl.position, computeRayDir(rightCtrl.orientation), headInLocal);
         if (leftCtrlValid)  leftHit  = panelMgr.Raycast(leftCtrl.position,  computeRayDir(leftCtrl.orientation),  headInLocal);
+        // v0.8-1b: propagate bar hover state to Kotlin renderer (only on transition)
+        {
+            static std::vector<bool> prevBarHov;
+            if ((int)prevBarHov.size() != (int)panelMgr.Panels().size()) prevBarHov.resize(panelMgr.Panels().size(), false);
+            // Reset hover for all panels first
+            for (size_t pi = 0; pi < panelMgr.Panels().size(); ++pi) panelMgr.PanelAt((int)pi).barHovered = false;
+            if (rightHit.panelIdx >= 0 && rightHit.hitBar) panelMgr.PanelAt(rightHit.panelIdx).barHovered = true;
+            if (leftHit.panelIdx >= 0 && leftHit.hitBar) panelMgr.PanelAt(leftHit.panelIdx).barHovered = true;
+            for (size_t pi = 0; pi < panelMgr.Panels().size(); ++pi) {
+                bool now = panelMgr.PanelAt((int)pi).barHovered;
+                if (now != prevBarHov[pi]) {
+                    CallNotifyBarHover(androidApp, (int)pi, now);
+                    prevBarHov[pi] = now;
+                }
+            }
+        }
         {
             // v0.7.2-diag: log on trigger press-transition so we can see what user "clicked" on
             static bool prevL = false, prevR = false;
@@ -2274,15 +2647,82 @@ int main() {
                                 (int)(uv_u * pRef.width), (int)(uv_v * pRef.height));
                         }
                     } else {
-                        // Start MOVE (existing — solid panel or bar hit)
-                        grabbedIdx = useHit.panelIdx;
-                        grabbedHand = hand;
-                        grabDist = useHit.distance;
-                        if (grabDist < 0.2f) grabDist = 0.2f;
-                        grabOffsetWorld.x = panelWorld.position.x - grabPoint.x;
-                        grabOffsetWorld.y = panelWorld.position.y - grabPoint.y;
-                        grabOffsetWorld.z = panelWorld.position.z - grabPoint.z;
-                        grabOrient = panelWorld.orientation;
+                        // v0.8-1b: if bar hit and panel has actionBar, sub-hit-test for buttons/slider
+                        if (useHit.hitBar && panelMgr.PanelAt(useHit.panelIdx).barOesTexId != 0) {
+                            // Compute bar-local UV from world hit point.
+                            auto qrot4 = [](const XrQuaternionf& q, XrVector3f vv) {
+                                float x=q.x,y=q.y,z=q.z,w=q.w;
+                                float ix =  w*vv.x + y*vv.z - z*vv.y;
+                                float iy =  w*vv.y + z*vv.x - x*vv.z;
+                                float iz =  w*vv.z + x*vv.y - y*vv.x;
+                                float iw = -x*vv.x - y*vv.y - z*vv.z;
+                                return XrVector3f{
+                                    ix*w + iw*-x + iy*-z - iz*-y,
+                                    iy*w + iw*-y + iz*-x - ix*-z,
+                                    iz*w + iw*-z + ix*-y - iy*-x
+                                };
+                            };
+                            const auto& p = panelMgr.PanelAt(useHit.panelIdx);
+                            XrPosef pw = panelWorld;
+                            // Bar world pose: shift down from panel center
+                            // bar height is constant 0.030f; not needed for u-only sub-hit
+                            XrVector3f axX2 = qrot4(pw.orientation, {1,0,0});
+                            XrVector3f axY2 = qrot4(pw.orientation, {0,1,0});
+                            // grabPoint is world hit
+                            float rx = grabPoint.x - pw.position.x;
+                            float ry = grabPoint.y - pw.position.y;
+                            float rz = grabPoint.z - pw.position.z;
+                            float u_m = rx*axX2.x + ry*axX2.y + rz*axX2.z;
+                            float v_m = rx*axY2.x + ry*axY2.y + rz*axY2.z;
+                            // bar sits below panel, so v_m is negative. Map to bar-local UV.
+                            float barW = p.size.width * 1.0f;
+                            float baruv_u = (u_m + 0.5f * barW) / barW;
+                            // For hit-test scope, we don't need vertical UV; Kotlin cares only about u
+                            int act = CallHandleBarHit(androidApp, useHit.panelIdx, baruv_u, 0.5f);
+                            if (act == 4) {
+                                g_sliderPanelIdx = useHit.panelIdx;
+                                g_sliderHand = hand;
+                                ALOGE("[rover-bar] slider grab start pi=%d", useHit.panelIdx);
+                            } else if (act == 2) {
+                                // Hide: keep VD alive, just make panel invisible
+                                panelMgr.PanelAt(useHit.panelIdx).visible = false;
+                                ALOGE("[rover-bar] hide pi=%d", useHit.panelIdx);
+                            } else if (act == 3) {
+                                // DoF cycle: HeadLocked(0) -> YawLocked(3) -> BodyLocked(2) -> WorldAnchored(1) -> repeat
+                                rover::DofMode cur = panelMgr.PanelAt(useHit.panelIdx).dofMode;
+                                rover::DofMode next;
+                                switch (cur) {
+                                    case rover::DofMode::HeadLocked: next = rover::DofMode::YawLocked; break;
+                                    case rover::DofMode::YawLocked: next = rover::DofMode::BodyLocked; break;
+                                    case rover::DofMode::BodyLocked: next = rover::DofMode::WorldAnchored; break;
+                                    default: next = rover::DofMode::HeadLocked; break;
+                                }
+                                panelMgr.PanelAt(useHit.panelIdx).dofMode = next;
+                                ALOGE("[rover-bar] dof pi=%d cycled", useHit.panelIdx);
+                            } else if (act >= 1) {
+                                ALOGE("[rover-bar] button pi=%d act=%d handled by Kotlin", useHit.panelIdx, act);
+                            } else {
+                                // No button / slider — normal drag
+                                grabbedIdx = useHit.panelIdx;
+                                grabbedHand = hand;
+                                grabDist = useHit.distance;
+                                if (grabDist < 0.2f) grabDist = 0.2f;
+                                grabOffsetWorld.x = panelWorld.position.x - grabPoint.x;
+                                grabOffsetWorld.y = panelWorld.position.y - grabPoint.y;
+                                grabOffsetWorld.z = panelWorld.position.z - grabPoint.z;
+                                grabOrient = panelWorld.orientation;
+                            }
+                        } else {
+                            // Existing MOVE path
+                            grabbedIdx = useHit.panelIdx;
+                            grabbedHand = hand;
+                            grabDist = useHit.distance;
+                            if (grabDist < 0.2f) grabDist = 0.2f;
+                            grabOffsetWorld.x = panelWorld.position.x - grabPoint.x;
+                            grabOffsetWorld.y = panelWorld.position.y - grabPoint.y;
+                            grabOffsetWorld.z = panelWorld.position.z - grabPoint.z;
+                            grabOrient = panelWorld.orientation;
+                        }
                     }
                 }
             }
@@ -2363,36 +2803,88 @@ int main() {
         // and on stability (~15 frames after last change) we fire VD.resize + swapchain rebuild
         // at physicalSize * pixelsPerMeter so the app re-layouts at new pixel resolution.
         {
-            static float lastW = -1.0f, lastH = -1.0f;
-            static int stableCount = 0;
-            static int lastCommittedW = 0, lastCommittedH = 0;
-            const auto& p0 = panelMgr.PanelAt(0);
-            const float eps = 0.001f;
-            bool sizeChanged = (std::fabs(p0.size.width  - lastW) > eps) ||
-                               (std::fabs(p0.size.height - lastH) > eps);
-            if (sizeChanged) {
-                lastW = p0.size.width;
-                lastH = p0.size.height;
-                stableCount = 0;
-            } else {
-                stableCount++;
-            }
+            // v0.8-fix-reflow: iterate all oesSourced panels; per-panel stable-count + last-committed
+            struct ReflowState { float lastW; float lastH; int stableCount; int lastCommittedW; int lastCommittedH; };
+            static std::vector<ReflowState> refl;
+            if ((int)refl.size() != (int)panelMgr.Panels().size())
+                refl.resize(panelMgr.Panels().size(), {-1.0f, -1.0f, 0, 0, 0});
             float ppm = CallGetPixelsPerMeter(androidApp);
             int dpi = CallGetCurrentDpi(androidApp);
-            int wantW = (int)(p0.size.width  * ppm);
-            int wantH = (int)(p0.size.height * ppm);
-            if (wantW < 320) wantW = 320; if (wantH < 240) wantH = 240;
-            if (wantW > 8192) wantW = 8192; if (wantH > 8192) wantH = 8192;
-            if (stableCount == 15 && (wantW != lastCommittedW || wantH != lastCommittedH)) {
-                ALOGE("[rover] COMMIT %.3fx%.3fm -> %dx%dpx @ %ddpi (ppm=%.0f)",
-                    p0.size.width, p0.size.height, wantW, wantH, dpi, ppm);
-                CallResizeVirtualDisplay(androidApp, wantW, wantH, dpi);
-                panelMgr.ResizePanelSwapchain(0, wantW, wantH);
-                lastCommittedW = wantW;
-                lastCommittedH = wantH;
+            const float eps = 0.001f;
+            for (int pi = 0; pi < (int)panelMgr.Panels().size(); ++pi) {
+                const auto& pp = panelMgr.PanelAt(pi);
+                if (!pp.oesSourced) continue;
+                if (pp.isKeyboard) continue;  // kb has its own fixed-size render
+                ReflowState& st = refl[pi];
+                bool sizeChanged = (std::fabs(pp.size.width  - st.lastW) > eps) ||
+                                   (std::fabs(pp.size.height - st.lastH) > eps);
+                if (sizeChanged) { st.lastW = pp.size.width; st.lastH = pp.size.height; st.stableCount = 0; }
+                else st.stableCount++;
+                int wantW = (int)(pp.size.width  * ppm);
+                int wantH = (int)(pp.size.height * ppm);
+                if (wantW < 320) wantW = 320; if (wantH < 240) wantH = 240;
+                if (wantW > 8192) wantW = 8192; if (wantH > 8192) wantH = 8192;
+                if (st.stableCount == 15 && (wantW != st.lastCommittedW || wantH != st.lastCommittedH)) {
+                    ALOGE("[rover] COMMIT pi=%d %.3fx%.3fm -> %dx%dpx @ %ddpi (ppm=%.0f)",
+                        pi, pp.size.width, pp.size.height, wantW, wantH, dpi, ppm);
+                    if (pi == 0) {
+                        CallResizeVirtualDisplay(androidApp, wantW, wantH, dpi);
+                    } else {
+                        CallResizeHostedApp(androidApp, pi, wantW, wantH, dpi);
+                    }
+                    panelMgr.ResizePanelSwapchain(pi, wantW, wantH);
+                    st.lastCommittedW = wantW;
+                    st.lastCommittedH = wantH;
+                }
             }
         }
         g_prevResizedIdx = resizedIdx;
+
+        // v0.8-1b: bar-slider drag — while held, map ray-x on bar to slider value 0..1
+        if (g_sliderPanelIdx >= 0) {
+            bool trig = (g_sliderHand == 1) ? leftTrigger : rightTrigger;
+            if (!trig) {
+                ALOGE("[rover-bar] slider release pi=%d", g_sliderPanelIdx);
+                g_sliderPanelIdx = -1; g_sliderHand = 0;
+            } else {
+                // Raycast against this panel's bar to get current uv-x
+                const rover::HitResult& h = (g_sliderHand == 1) ? leftHit : rightHit;
+                if (h.panelIdx == g_sliderPanelIdx && h.hitBar) {
+                    XrPosef panelW = panelMgr.ResolveWorldPose(g_sliderPanelIdx, headInLocal);
+                    auto qrot5 = [](const XrQuaternionf& q, XrVector3f vv) {
+                        float x=q.x,y=q.y,z=q.z,w=q.w;
+                        float ix =  w*vv.x + y*vv.z - z*vv.y;
+                        float iy =  w*vv.y + z*vv.x - x*vv.z;
+                        float iz =  w*vv.z + x*vv.y - y*vv.x;
+                        float iw = -x*vv.x - y*vv.y - z*vv.z;
+                        return XrVector3f{
+                            ix*w + iw*-x + iy*-z - iz*-y,
+                            iy*w + iw*-y + iz*-x - ix*-z,
+                            iz*w + iw*-z + ix*-y - iy*-x
+                        };
+                    };
+                    XrVector3f axX3 = qrot5(panelW.orientation, {1,0,0});
+                    // Ray-plane intersection with bar plane — reuse grabPoint from earlier if valid; else compute
+                    // For simplicity, use panel's own hit at current frame — approximate as ray + hit.distance
+                    XrPosef ctrl = (g_sliderHand == 1) ? leftCtrl : rightCtrl;
+                    XrVector3f rd = computeRayDir(ctrl.orientation);
+                    XrVector3f hitPt = {
+                        ctrl.position.x + h.distance * rd.x,
+                        ctrl.position.y + h.distance * rd.y,
+                        ctrl.position.z + h.distance * rd.z
+                    };
+                    float rx = hitPt.x - panelW.position.x;
+                    float ry = hitPt.y - panelW.position.y;
+                    float rz = hitPt.z - panelW.position.z;
+                    float u_m = rx*axX3.x + ry*axX3.y + rz*axX3.z;
+                    float barW = panelMgr.PanelAt(g_sliderPanelIdx).size.width;
+                    float baruv_u = (u_m + 0.5f * barW) / barW;
+                    if (baruv_u < 0.f) baruv_u = 0.f; if (baruv_u > 1.f) baruv_u = 1.f;
+                    CallUpdateBarSlider(androidApp, g_sliderPanelIdx, baruv_u);
+                    panelMgr.PanelAt(g_sliderPanelIdx).panelAlpha = baruv_u;
+                }
+            }
+        }
 
         // v0.7.1: keyboard hold-to-repeat — after 400ms, fire every 60ms while held
         if (kbHeldHand != 0) {
@@ -2418,11 +2910,11 @@ int main() {
                 int y = (int)(tapStartV * p.height);
                 if (x < 0) x = 0; if (x >= p.width) x = p.width - 1;
                 if (y < 0) y = 0; if (y >= p.height) y = p.height - 1;
-                int did = CallGetPanelDisplayId(androidApp);
+                int did = CallPanelIdxToDisplayId(androidApp, tapPanelIdx);
                 long nowMs = (long)(std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now().time_since_epoch()).count());
                 long held = nowMs - tapStartTimeMs;
-                ALOGE("[rover-tap] FIRE did=%d px=(%d,%d) held=%ldms", did, x, y, held);
+                ALOGE("[rover-tap] FIRE pi=%d did=%d px=(%d,%d) held=%ldms", tapPanelIdx, did, x, y, held);
                 if (did >= 0) {
                     if (held < 500) {
                         CallInjectTap(androidApp, did, x, y);      // quick tap
@@ -2487,7 +2979,7 @@ int main() {
                     int y1 = cy - delta / 2;
                     int y2 = cy + delta / 2;
                     if (y1 < 0) y1 = 0; if (y2 >= p.height) y2 = p.height - 1;
-                    int did = CallGetPanelDisplayId(androidApp);
+                    int did = CallPanelIdxToDisplayId(androidApp, h.panelIdx);
                     if (did >= 0) {
                         CallInjectSwipe(androidApp, did, cx, y1, cx, y2, 100);
                     }
@@ -2533,7 +3025,7 @@ int main() {
         {
             float rw=0.f, rh=0.f;
             static float lastRw=1.024f, lastRh=0.640f;
-            if (CallGetPanelWorld(androidApp, &rw, &rh) && rw > 0 && rh > 0) {
+            if (!panelMgr.Panels().empty() && CallGetPanelWorld(androidApp, &rw, &rh) && rw > 0 && rh > 0) {
                 if (std::fabs(rw - lastRw) > 0.001f || std::fabs(rh - lastRh) > 0.001f) {
                     panelMgr.PanelAt(0).size.width = rw;
                     panelMgr.PanelAt(0).size.height = rh;
@@ -2555,12 +3047,14 @@ int main() {
             panelMgr.UpdateDynamic(frameState.predictedDisplayTime * 1e-9f);
             // v0.4.2d2: pump SurfaceTexture + blit OES into any oesSourced panel
             static bool g_launchedTestApp = false;
-            if (g_oesTextureId != 0) {
-                CallUpdateSurfaceTexImage(androidApp);
+            {  // v0.8-fix: was guarded by g_oesTextureId != 0 (primary OES) — no longer required
+                if (g_oesTextureId != 0) CallUpdateSurfaceTexImage(androidApp);
             CallUpdateKbSurfaceTexImage(androidApp);
+            CallUpdateAllHostedTexImages(androidApp);
+            CallUpdateAllBarTexImages(androidApp);
 for (int pi = 0; pi < (int)panelMgr.Panels().size(); pi++) {
                     if (panelMgr.PanelAt(pi).oesSourced) {
-                        float kStMat[16]; bool haveMat = CallGetSTMatrix(androidApp, kStMat);
+                        float kStMat[16]; bool haveMat = CallGetSTMatrixForPanel(androidApp, (int)pi, kStMat);
                         static int dbg_ctr = 0;
                         if ((dbg_ctr++ % 30) == 0) {
                             ALOGE("[rover-dbg] pi=%d oesTex=%u swapWH=%dx%d worldWH=%.3fx%.3f haveMat=%d ST=[%.3f %.3f %.3f %.3f|%.3f %.3f %.3f %.3f|%.3f %.3f %.3f %.3f|%.3f %.3f %.3f %.3f]",
@@ -2574,6 +3068,11 @@ for (int pi = 0; pi < (int)panelMgr.Panels().size(); pi++) {
                         GLuint useTex = panelMgr.PanelAt(pi).oesTextureId ? panelMgr.PanelAt(pi).oesTextureId : g_oesTextureId;
                         const float* useStMat = haveMat ? kStMat : nullptr;
                         oesBlitter.BlitToPanel(panelMgr.PanelAt(pi), useTex, useStMat);
+                        // v0.8-1b: blit bar OES for this panel if present
+                        if (panelMgr.PanelAt(pi).barOesTexId != 0) {
+                            float barStMat[16]; bool haveBar = CallGetBarSTMatrix(androidApp, (int)pi, barStMat);
+                            oesBlitter.BlitToBar(panelMgr.PanelAt(pi), panelMgr.PanelAt(pi).barOesTexId, haveBar ? barStMat : nullptr);
+                        }
                     }
                 }
             }

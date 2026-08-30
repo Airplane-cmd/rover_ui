@@ -60,7 +60,7 @@ class RoverActivity : NativeActivity() {
                 Runtime.getRuntime().exec(arrayOf("su", "-c",
                     "cmd input_method ime enable com.gantrping.rover/.RoverImeService; " +
                     "cmd input_method ime set com.gantrping.rover/.RoverImeService; " +
-                    "cmd input_method ime disable com.oculus.vrshell/com.oculus.panelapp.keyboardv2.KeyboardInputMethodService")).waitFor()
+                    "cmd input_method ime disable com.oculus.vrshell/com.oculus.panelapp.keyboardv2.KeyboardInputMethodService; cmd input_method ime disable com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME; cmd input_method ime disable helium314.keyboard/.latin.LatinIME")).waitFor()
                 Log.i("RoverBridge", "IME auto-set + Meta IME disabled")
             } catch (e: Throwable) { Log.e("RoverBridge", "IME auto-set failed", e) }
         }.start()
@@ -83,6 +83,15 @@ class RoverActivity : NativeActivity() {
         try { unregisterReceiver(cfgReceiver) } catch (_: Throwable) {}
         RoverBridge.cleanupLaunchedApps()
         RoverBridge.setActivity(null)
+        // v0.8-fixes: re-enable all system IMEs (we disabled them at startup)
+        Thread {
+            try {
+                Runtime.getRuntime().exec(arrayOf("su", "-c",
+                    "cmd input_method ime enable com.oculus.vrshell/com.oculus.panelapp.keyboardv2.KeyboardInputMethodService; " +
+                    "cmd input_method ime enable com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME; " +
+                    "cmd input_method ime enable helium314.keyboard/.latin.LatinIME")).waitFor()
+            } catch (_: Throwable) {}
+        }.start()
         super.onDestroy()
     }
 
