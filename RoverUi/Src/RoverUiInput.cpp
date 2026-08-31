@@ -162,9 +162,12 @@ XrActionStateVector2f rightThumbState;
 XrActionStateBoolean rightBButtonState;
 XrActionStateBoolean leftXButtonState;
 XrActionStateBoolean rightAButtonState;
+XrActionStateBoolean leftGripState;
+XrActionStateBoolean rightGripState;
 static XrAction captureButtonAction = XR_NULL_HANDLE;
 static XrAction leftXButtonAction = XR_NULL_HANDLE;
 static XrAction rightAButtonAction = XR_NULL_HANDLE;
+static XrAction gripAction = XR_NULL_HANDLE;
 static XrAction thumbstickAction = XR_NULL_HANDLE;
 
 bool leftControllerActive = false;
@@ -204,6 +207,9 @@ void AppInput_init(App& app) {
     rightAButtonAction = CreateAction(
         runningActionSet, XR_ACTION_TYPE_BOOLEAN_INPUT, "right_a_btn", "Right A Button");
 
+    gripAction = CreateAction(
+        runningActionSet, XR_ACTION_TYPE_BOOLEAN_INPUT, "grip", "Grip (rotate workspace)", 2, handSubactionPaths);
+
     gripPoseAction = CreateAction(
         runningActionSet, XR_ACTION_TYPE_POSE_INPUT, "grip_pose", nullptr, 2, handSubactionPaths);
 
@@ -239,6 +245,10 @@ void AppInput_init(App& app) {
             ActionSuggestedBinding(app, leftXButtonAction, "/user/hand/left/input/x/click"));
         bindings.push_back(
             ActionSuggestedBinding(app, rightAButtonAction, "/user/hand/right/input/a/click"));
+        bindings.push_back(
+            ActionSuggestedBinding(app, gripAction, "/user/hand/left/input/squeeze/value"));
+        bindings.push_back(
+            ActionSuggestedBinding(app, gripAction, "/user/hand/right/input/squeeze/value"));
 
         XrInteractionProfileSuggestedBinding suggestedBindings = {
             XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
@@ -327,5 +337,13 @@ void AppInput_syncActions(App& app) {
         gi.subactionPath = XR_NULL_PATH;
         rightAButtonState = {XR_TYPE_ACTION_STATE_BOOLEAN};
         OXR(xrGetActionStateBoolean(app.Session, &gi, &rightAButtonState));
+
+        gi.action = gripAction;
+        gi.subactionPath = leftHandPath;
+        leftGripState = {XR_TYPE_ACTION_STATE_BOOLEAN};
+        OXR(xrGetActionStateBoolean(app.Session, &gi, &leftGripState));
+        gi.subactionPath = rightHandPath;
+        rightGripState = {XR_TYPE_ACTION_STATE_BOOLEAN};
+        OXR(xrGetActionStateBoolean(app.Session, &gi, &rightGripState));
     }
 }

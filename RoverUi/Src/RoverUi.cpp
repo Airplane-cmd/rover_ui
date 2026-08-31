@@ -2425,6 +2425,206 @@ int main() {
         }
         if (rightCtrlValid) rightHit = panelMgr.Raycast(rightCtrl.position, computeRayDir(rightCtrl.orientation), headInLocal);
         if (leftCtrlValid)  leftHit  = panelMgr.Raycast(leftCtrl.position,  computeRayDir(leftCtrl.orientation),  headInLocal);
+
+        // v0.8.1: grip-to-rotate — hold either grip, all non-kb panels follow controller rotation
+        //         around head with damping; on release, keep spinning with friction until stopped.
+        {
+            static int gripHand = 0;  // 0=none, 1=left, 2=right
+            static XrQuaternionf gripCtrlStartInv = {0,0,0,1};
+            static std::vector<XrPosef> capturedPose;
+            static std::vector<XrVector3f> capturedHeadRel;   // panel - head at grip start
+            static std::vector<bool> capturedValid;
+            static std::vector<XrQuaternionf> panelOrient;  // current interpolated orientation
+            static std::vector<XrVector3f> panelPos;
+            static std::vector<XrQuaternionf> panelAngVel; // per-panel angular velocity (small delta)
+            static bool inertiaActive = false;
+
+            const float DAMPING = 0.25f;     // slerp factor toward target while held
+            const float FRICTION = 0.995f;   // per-frame decay — much higher for long free spin
+            const float VEL_STOP = 0.00005f; // stop only when velocity is truly tiny
+
+            auto qmul2 = [](const XrQuaternionf& a, const XrQuaternionf& b) {
+                return XrQuaternionf{
+                    a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+                    a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+                    a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
+                    a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z
+                };
+            };
+            auto qconj = [](const XrQuaternionf& q) {
+                return XrQuaternionf{-q.x, -q.y, -q.z, q.w};
+            };
+            auto qrotV2 = [](const XrQuaternionf& q, XrVector3f v) {
+                float x=q.x,y=q.y,z=q.z,w=q.w;
+                float ix =  w*v.x + y*v.z - z*v.y;
+                float iy =  w*v.y + z*v.x - x*v.z;
+                float iz =  w*v.z + x*v.y - y*v.x;
+                float iw = -x*v.x - y*v.y - z*v.z;
+                return XrVector3f{
+                    ix*w + iw*-x + iy*-z - iz*-y,
+                    iy*w + iw*-y + iz*-x - ix*-z,
+                    iz*w + iw*-z + ix*-y - iy*-x
+                };
+            };
+            auto qslerp = [&](const XrQuaternionf& a, const XrQuaternionf& b, float t) {
+                float d = a.x*b.x + a.y*b.y + a.z*b.z + a.w*b.w;
+                XrQuaternionf bs = b;
+                if (d < 0) { bs = {-b.x,-b.y,-b.z,-b.w}; d = -d; }
+                if (d > 0.9995f) {
+                    XrQuaternionf r = {a.x + t*(bs.x-a.x), a.y + t*(bs.y-a.y),
+                                       a.z + t*(bs.z-a.z), a.w + t*(bs.w-a.w)};
+                    float n = std::sqrt(r.x*r.x + r.y*r.y + r.z*r.z + r.w*r.w);
+                    if (n > 0.0001f) { r.x/=n; r.y/=n; r.z/=n; r.w/=n; }
+                    return r;
+                }
+                float th0 = std::acos(d), th = th0 * t;
+                float sinTh = std::sin(th), sinTh0 = std::sin(th0);
+                float s0 = std::cos(th) - d * sinTh / sinTh0;
+                float s1 = sinTh / sinTh0;
+                return XrQuaternionf{s0*a.x + s1*bs.x, s0*a.y + s1*bs.y,
+                                     s0*a.z + s1*bs.z, s0*a.w + s1*bs.w};
+            };
+
+            bool anyGrip = (leftGripState.type != 0 && leftGripState.currentState != XR_FALSE)
+                        || (rightGripState.type != 0 && rightGripState.currentState != XR_FALSE);
+            int newHand = 0;
+            if (leftGripState.type != 0 && leftGripState.currentState != XR_FALSE) newHand = 1;
+            else if (rightGripState.type != 0 && rightGripState.currentState != XR_FALSE) newHand = 2;
+
+            // Resize state vectors to panel count on demand
+            int panelCount = (int)panelMgr.Panels().size();
+            auto resizeIfNeeded = [&]() {
+                if ((int)panelOrient.size() != panelCount) {
+                    panelOrient.resize(panelCount, {0,0,0,1});
+                    panelPos.resize(panelCount, {0,0,0});
+                    panelAngVel.resize(panelCount, {0,0,0,1});
+                    capturedPose.resize(panelCount);
+                    capturedHeadRel.resize(panelCount, {0,0,0});
+                    capturedValid.resize(panelCount, false);
+                    for (int pi = 0; pi < panelCount; pi++) {
+                        XrPosef w = panelMgr.ResolveWorldPose(pi, headInLocal);
+                        panelOrient[pi] = w.orientation;
+                        panelPos[pi] = w.position;
+                    }
+                }
+            };
+            resizeIfNeeded();
+
+            // Grip newly pressed → capture start state
+            if (gripHand == 0 && newHand != 0) {
+                gripHand = newHand;
+                inertiaActive = false;
+                XrPosef ctrlPose = (gripHand == 1) ? leftCtrl : rightCtrl;
+                gripCtrlStartInv = qconj(ctrlPose.orientation);
+                for (int pi = 0; pi < panelCount; pi++) {
+                    const auto& pp = panelMgr.PanelAt(pi);
+                    if (pp.isKeyboard) { capturedValid[pi] = false; continue; }
+                    XrPosef w = panelMgr.ResolveWorldPose(pi, headInLocal);
+                    capturedPose[pi] = w;
+                    capturedHeadRel[pi] = {w.position.x - headInLocal.position.x,
+                                           w.position.y - headInLocal.position.y,
+                                           w.position.z - headInLocal.position.z};
+                    capturedValid[pi] = true;
+                    panelOrient[pi] = w.orientation;
+                    panelPos[pi] = w.position;
+                    panelAngVel[pi] = {0,0,0,1};
+                }
+                ALOGE("[rover-grip] START hand=%d", gripHand);
+            }
+
+            // While held: compute target and slerp toward it; also track angular velocity per panel
+            if (gripHand != 0) {
+                bool stillHeld = (gripHand == 1) ? (leftGripState.currentState != XR_FALSE)
+                                                 : (rightGripState.currentState != XR_FALSE);
+                if (!stillHeld) {
+                    ALOGE("[rover-grip] RELEASE hand=%d -> inertia", gripHand);
+                    inertiaActive = true;
+                    gripHand = 0;
+                } else {
+                    XrPosef ctrlPose = (gripHand == 1) ? leftCtrl : rightCtrl;
+                    // delta from initial press (for target pose)
+                    XrQuaternionf deltaR = qmul2(ctrlPose.orientation, gripCtrlStartInv);
+                    // per-frame controller delta (raw angular velocity source for post-release spin)
+                    static XrQuaternionf prevCtrlOri = ctrlPose.orientation;
+                    XrQuaternionf ctrlFrameDelta = qmul2(ctrlPose.orientation, qconj(prevCtrlOri));
+                    prevCtrlOri = ctrlPose.orientation;
+                    for (int pi = 0; pi < panelCount; pi++) {
+                        if (!capturedValid[pi]) continue;
+                        XrVector3f off = capturedHeadRel[pi];
+                        XrVector3f newOff = qrotV2(deltaR, off);
+                        XrVector3f targetPos = {headInLocal.position.x + newOff.x,
+                                                headInLocal.position.y + newOff.y,
+                                                headInLocal.position.z + newOff.z};
+                        XrQuaternionf targetOri = qmul2(deltaR, capturedPose[pi].orientation);
+                        panelOrient[pi] = qslerp(panelOrient[pi], targetOri, DAMPING);
+                        panelPos[pi].x += (targetPos.x - panelPos[pi].x) * DAMPING;
+                        panelPos[pi].y += (targetPos.y - panelPos[pi].y) * DAMPING;
+                        panelPos[pi].z += (targetPos.z - panelPos[pi].z) * DAMPING;
+                        // Velocity = raw controller delta (unfiltered), so release feels crisp
+                        panelAngVel[pi] = ctrlFrameDelta;
+                    }
+                }
+            }
+
+            // Inertia: after release, keep applying panelAngVel and decay it
+            if (inertiaActive) {
+                bool anyMoving = false;
+                for (int pi = 0; pi < panelCount; pi++) {
+                    if (!capturedValid[pi]) continue;
+                    panelOrient[pi] = qmul2(panelAngVel[pi], panelOrient[pi]);
+                    // Rotate the head-relative offset — walking follows automatically
+                    capturedHeadRel[pi] = qrotV2(panelAngVel[pi], capturedHeadRel[pi]);
+                    panelPos[pi] = {headInLocal.position.x + capturedHeadRel[pi].x,
+                                    headInLocal.position.y + capturedHeadRel[pi].y,
+                                    headInLocal.position.z + capturedHeadRel[pi].z};
+                    XrQuaternionf ident = {0,0,0,1};
+                    panelAngVel[pi] = qslerp(panelAngVel[pi], ident, 1.0f - FRICTION);
+                    if (std::fabs(1.0f - panelAngVel[pi].w) > VEL_STOP) anyMoving = true;
+                }
+                if (!anyMoving) inertiaActive = false;
+            }
+
+            // Apply interpolated pose to each non-kb panel (updates p.pose based on DofMode)
+            if (gripHand != 0 || inertiaActive) {
+                for (int pi = 0; pi < panelCount; pi++) {
+                    if (!capturedValid[pi]) continue;
+                    auto& pp = panelMgr.PanelAt(pi);
+                    // Convert interpolated world pose back into pp.pose per DofMode
+                    switch (pp.dofMode) {
+                        case rover::DofMode::WorldAnchored: {
+                            pp.pose.position = panelPos[pi];
+                            pp.pose.orientation = panelOrient[pi];
+                            break;
+                        }
+                        case rover::DofMode::BodyLocked: {
+                            pp.pose.position = {panelPos[pi].x - headInLocal.position.x,
+                                                panelPos[pi].y - headInLocal.position.y,
+                                                panelPos[pi].z - headInLocal.position.z};
+                            pp.pose.orientation = panelOrient[pi];
+                            break;
+                        }
+                        case rover::DofMode::HeadLocked: {
+                            // Convert world -> head local: p.pose = head^-1 * world_pose
+                            XrQuaternionf hInv = qconj(headInLocal.orientation);
+                            XrVector3f dp = {panelPos[pi].x - headInLocal.position.x,
+                                             panelPos[pi].y - headInLocal.position.y,
+                                             panelPos[pi].z - headInLocal.position.z};
+                            pp.pose.position = qrotV2(hInv, dp);
+                            pp.pose.orientation = qmul2(hInv, panelOrient[pi]);
+                            break;
+                        }
+                        case rover::DofMode::YawLocked: {
+                            // Approximate — treat like BodyLocked for grip
+                            pp.pose.position = {panelPos[pi].x - headInLocal.position.x,
+                                                panelPos[pi].y - headInLocal.position.y,
+                                                panelPos[pi].z - headInLocal.position.z};
+                            pp.pose.orientation = panelOrient[pi];
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         // v0.8-1b: propagate bar hover state to Kotlin renderer (only on transition)
         {
             static std::vector<bool> prevBarHov;

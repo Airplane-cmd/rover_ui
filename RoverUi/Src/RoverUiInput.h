@@ -58,3 +58,5 @@ extern XrActionStateVector2f rightThumbState;
 extern XrActionStateBoolean rightBButtonState;
 extern XrActionStateBoolean leftXButtonState;
 extern XrActionStateBoolean rightAButtonState;
+extern XrActionStateBoolean leftGripState;
+extern XrActionStateBoolean rightGripState;
