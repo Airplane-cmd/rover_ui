@@ -164,6 +164,24 @@ bool PanelManager::ResizePanelSwapchain(int panelIdx, int32_t newW, int32_t newH
     return true;
 }
 
+// v0.8.4 #14: free per-panel resources; slot kept (indices stable) with dead=true
+void PanelManager::DestroyPanelResources(int idx) {
+    if (idx < 0 || idx >= (int)panels_.size()) return;
+    Panel& p = panels_[idx];
+    if (p.dead) return;
+    if (p.swapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(p.swapchain);
+        p.swapchain = XR_NULL_HANDLE;
+    }
+    if (p.barSwapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(p.barSwapchain);
+        p.barSwapchain = XR_NULL_HANDLE;
+    }
+    p.dead = true;
+    p.visible = false;
+    __android_log_print(ANDROID_LOG_ERROR, "PanelManager", "DestroyPanelResources idx=%d done", idx);
+}
+
 static float ExtractYaw(const XrQuaternionf& q) {
     return std::atan2(2.0f * (q.w * q.y + q.z * q.x),
                        1.0f - 2.0f * (q.y * q.y + q.x * q.x));
@@ -330,6 +348,7 @@ HitResult PanelManager::Raycast(const XrVector3f& rayOrigin, const XrVector3f& r
     HitResult best = {-1, false, -1, 1e9f};
     for (int i = 0; i < static_cast<int>(panels_.size()); i++) {
         const Panel& p = panels_[i];
+        if (p.dead) continue;
         if (!p.visible) continue;
         XrPosef world = ResolveWorldPose(i, headPoseInLocal);
 
@@ -391,7 +410,9 @@ void PanelManager::BuildLayers(XrCompositionLayerQuad* outQuads, int outCap, int
     for (int i = 0; i < static_cast<int>(panels_.size()); i++) {
         if (count >= outCap) break;
         const Panel& p = panels_[i];
+        if (p.dead) continue;         // v0.8.4 #14
         if (!p.visible) continue;
+        if (p.bodyHidden) continue;  // v0.8.3 #8: bar still renders (below), body doesn't
         XrPosef world = ResolveWorldPose(i, headPoseInLocal);
         world.orientation = QNorm(world.orientation);
         if (!VecFinite(world.position)) continue;
@@ -411,8 +432,9 @@ void PanelManager::BuildLayers(XrCompositionLayerQuad* outQuads, int outCap, int
     for (int i = 0; i < static_cast<int>(panels_.size()); i++) {
         if (count >= outCap) break;
         const Panel& p = panels_[i];
+        if (p.dead) continue;         // v0.8.4 #14
         if (!p.visible) continue;
-        if (p.isKeyboard) continue;  // v0.8-fixes-2: kb has no bar (saves layers)
+        if (p.isKeyboard || p.isDock || p.isLauncher) continue;  // v0.9.2: kb/dock/launcher no bar
         XrPosef world = ResolveWorldPose(i, headPoseInLocal);
         float barH = p.barHovered ? BAR_HOVER_HEIGHT_M : BAR_HEIGHT_M;
         float barW = p.size.width * (p.barHovered ? BAR_HOVER_WIDTH_RATIO : BAR_WIDTH_RATIO);

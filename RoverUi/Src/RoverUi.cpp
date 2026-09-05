@@ -642,6 +642,14 @@ void UpdateStageBounds(App& app) {
 static GLuint g_oesTextureId = 0;
 static GLuint g_kbOesTextureId = 0;
 static int g_kbPanelIdx = -1;
+static GLuint g_dockOesTextureId = 0;
+static int g_dockPanelIdx = -1;
+static GLuint g_launcherOesTextureId = 0;
+static int g_launcherPanelIdx = -1;
+// v0.8.5: deferred destroy queue — actual GL/XR destruction happens N frames after close request
+struct PendingKill { int idx; GLuint bodyTex; GLuint barTex; int framesLeft; };
+static std::vector<PendingKill> g_pendingKills;
+
 static int g_sliderPanelIdx = -1;
 static int g_sliderHand = 0;  // v0.8-1b: bar-slider drag state  // v0.7.2: tracked so buttons can toggle visibility
 
@@ -715,6 +723,117 @@ static bool CallUpdateKbSurfaceTexImage(struct android_app* androidApp) {
     jboolean r = env->CallStaticBooleanMethod(g_bridgeCls, m);
     if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); return false; }
     return r == JNI_TRUE;
+}
+
+// v0.9: dock — Kotlin-drawn OES surface
+static void CallSetupDockOesTexture(struct android_app* androidApp, int panelIdx) {
+    glGenTextures(1, &g_dockOesTextureId);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, g_dockOesTextureId);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+    ALOGE("[rover-dock] OES tex created id=%u", g_dockOesTextureId);
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "setDockOesTextureId", "(II)V");
+    if (!m) { env->ExceptionClear(); return; }
+    env->CallStaticVoidMethod(g_bridgeCls, m, (jint)panelIdx, (jint)g_dockOesTextureId);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
+static bool CallUpdateDockSurfaceTexImage(struct android_app* androidApp) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return false;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return false;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "updateDockSurfaceTexImage", "()Z");
+    if (!m) { env->ExceptionClear(); return false; }
+    jboolean r = env->CallStaticBooleanMethod(g_bridgeCls, m);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); return false; }
+    return r == JNI_TRUE;
+}
+
+static void CallHandleDockHit(struct android_app* androidApp, float u, float v) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "handleDockHit", "(FF)V");
+    if (!m) { env->ExceptionClear(); return; }
+    env->CallStaticVoidMethod(g_bridgeCls, m, (jfloat)u, (jfloat)v);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
+static void CallSetupLauncherOesTexture(struct android_app* androidApp, int panelIdx) {
+    glGenTextures(1, &g_launcherOesTextureId);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, g_launcherOesTextureId);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+    ALOGE("[rover-launcher] OES tex created id=%u", g_launcherOesTextureId);
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "setLauncherOesTextureId", "(II)V");
+    if (!m) { env->ExceptionClear(); return; }
+    env->CallStaticVoidMethod(g_bridgeCls, m, (jint)panelIdx, (jint)g_launcherOesTextureId);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
+static bool CallUpdateLauncherSurfaceTexImage(struct android_app* androidApp) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return false;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return false;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "updateLauncherSurfaceTexImage", "()Z");
+    if (!m) { env->ExceptionClear(); return false; }
+    jboolean r = env->CallStaticBooleanMethod(g_bridgeCls, m);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); return false; }
+    return r == JNI_TRUE;
+}
+
+static void CallHandleLauncherHit(struct android_app* androidApp, float u, float v) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "handleLauncherHit", "(FF)V");
+    if (!m) { env->ExceptionClear(); return; }
+    env->CallStaticVoidMethod(g_bridgeCls, m, (jfloat)u, (jfloat)v);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
+static int CallPollLauncherVisRequest(struct android_app* androidApp) {
+    JavaVM* jvm = androidApp->activity->vm;
+    JNIEnv* env = nullptr;
+    jvm->AttachCurrentThread(&env, nullptr);
+    if (!env) return -1;
+    CacheBridgeClass(androidApp, env);
+    if (!g_bridgeCls) return -1;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "pollLauncherVisRequest", "()I");
+    if (!m) { env->ExceptionClear(); return -1; }
+    jint r = env->CallStaticIntMethod(g_bridgeCls, m);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); return -1; }
+    return (int)r;
 }
 
 static void CallHandleKeyboardHit(struct android_app* androidApp, float u, float v) {
@@ -1734,6 +1853,31 @@ int main() {
         panelMgr.PanelAt(kbIdx).isKeyboard = true;
         panelMgr.PanelAt(kbIdx).visible = false;         // hidden until Right-A press
         panelMgr.PanelAt(kbIdx).oesForceOpaque = false;  // v0.7.2: preserve alpha so key-gap bg is transparent
+
+        // v0.9: persistent dock — BodyLocked, small, below eye level, always visible
+        XrPosef dockPose = {{0,0,0,1}, {0.0f, -0.35f, -0.7f}};
+        int dockIdx = panelMgr.AddPanel(rover::DofMode::BodyLocked, dockPose,
+                                        {0.32f, 0.08f}, 0.10f, 0.10f, 0.10f, 0.0f, 512, 128);
+        panelMgr.PanelAt(dockIdx).oesSourced = true;
+        panelMgr.PanelAt(dockIdx).isDock = true;
+        panelMgr.PanelAt(dockIdx).visible = true;
+        panelMgr.PanelAt(dockIdx).oesForceOpaque = false;   // transparent gaps
+        panelMgr.PanelAt(dockIdx).pendingHeadAlign = true;  // face user at first frame
+        g_dockPanelIdx = dockIdx;
+        CallSetupDockOesTexture(androidApp, dockIdx);
+        panelMgr.PanelAt(dockIdx).oesTextureId = g_dockOesTextureId;
+
+        // v0.9.2: app launcher grid — HeadLocked, hidden by default, transparent
+        XrPosef launcherPose = {{0,0,0,1}, {0.0f, 0.05f, -1.2f}};
+        int launcherIdx = panelMgr.AddPanel(rover::DofMode::HeadLocked, launcherPose,
+                                            {0.85f, 0.75f}, 0.10f, 0.10f, 0.10f, 0.0f, 1024, 900);
+        panelMgr.PanelAt(launcherIdx).oesSourced = true;
+        panelMgr.PanelAt(launcherIdx).isLauncher = true;
+        panelMgr.PanelAt(launcherIdx).visible = false;
+        panelMgr.PanelAt(launcherIdx).oesForceOpaque = false;
+        g_launcherPanelIdx = launcherIdx;
+        CallSetupLauncherOesTexture(androidApp, launcherIdx);
+        panelMgr.PanelAt(launcherIdx).oesTextureId = g_launcherOesTextureId;
         g_kbPanelIdx = kbIdx;
         {
             // v0.8-fixes: tell Kotlin the keyboard's panelIdx so it can return its STMatrix
@@ -2293,6 +2437,17 @@ int main() {
             }
         }
         {
+            // v0.9.2: launcher visibility — Kotlin toggle via dock Apps button
+            int lreq = CallPollLauncherVisRequest(androidApp);
+            if (lreq >= 0 && g_launcherPanelIdx >= 0) {
+                panelMgr.PanelAt(g_launcherPanelIdx).visible = (lreq == 1);
+            } else if (lreq == -2 && g_launcherPanelIdx >= 0) {
+                bool now = !panelMgr.PanelAt(g_launcherPanelIdx).visible;
+                panelMgr.PanelAt(g_launcherPanelIdx).visible = now;
+                ALOGE("[rover-launcher] toggled -> visible=%d", now?1:0);
+            }
+        }
+        {
             // v0.8-1a: process pending spawn — create OES tex, add panel, notify Kotlin
             std::string pa = CallPollSpawnRequest(androidApp);
             if (!pa.empty()) {
@@ -2347,14 +2502,28 @@ int main() {
                 CallSetBarOesTextureId(androidApp, newIdx, (int)barTex, pkgOnly.c_str(), 1024, 64);
             }
             int closeIdx = CallPollCloseRequest(androidApp);
-            if (closeIdx >= 0) {
-                // For now: just mark invisible + notify Kotlin to release resources.
-                // (True panel removal from panelMgr is TODO — would shift indices.)
-                if (closeIdx < (int)panelMgr.Panels().size()) {
-                    panelMgr.PanelAt(closeIdx).visible = false;
-                }
+            if (closeIdx >= 0 && closeIdx < (int)panelMgr.Panels().size()) {
+                // v0.8.5: enqueue for deferred destroy; hide + release Kotlin resources now
+                g_pendingKills.push_back({closeIdx,
+                                          panelMgr.PanelAt(closeIdx).oesTextureId,
+                                          panelMgr.PanelAt(closeIdx).barOesTexId,
+                                          3});
+                panelMgr.PanelAt(closeIdx).visible = false;
+                panelMgr.PanelAt(closeIdx).dead = true;
                 CallOnPanelClosedNative(androidApp, closeIdx);
-                ALOGE("[rover-close] panel=%d hidden + Kotlin notified", closeIdx);
+                ALOGE("[rover-close] panel=%d marked dead; GL/XR destroy queued", closeIdx);
+            }
+            // Drain deferred kills every frame — even without a new close request
+            for (auto it = g_pendingKills.begin(); it != g_pendingKills.end();) {
+                if (--it->framesLeft <= 0) {
+                    panelMgr.DestroyPanelResources(it->idx);
+                    if (it->bodyTex != 0) glDeleteTextures(1, &it->bodyTex);
+                    if (it->barTex  != 0) glDeleteTextures(1, &it->barTex);
+                    ALOGE("[rover-close] panel=%d GL/XR destroyed (deferred)", it->idx);
+                    it = g_pendingKills.erase(it);
+                } else {
+                    ++it;
+                }
             }
         }
 
@@ -2520,7 +2689,7 @@ int main() {
                 prevCtrlOri = ctrlPose.orientation;  // v0.8.2/A3: baseline for this session
                 for (int pi = 0; pi < panelCount; pi++) {
                     const auto& pp = panelMgr.PanelAt(pi);
-                    if (pp.isKeyboard) { capturedValid[pi] = false; continue; }
+                    if (pp.isKeyboard || pp.isDock || pp.isLauncher) { capturedValid[pi] = false; continue; }
                     XrPosef w = panelMgr.ResolveWorldPose(pi, headInLocal);
                     capturedPose[pi] = w;
                     capturedHeadRel[pi] = {w.position.x - headInLocal.position.x,
@@ -2810,7 +2979,13 @@ int main() {
                         float v_m = rx*axY.x + ry*axY.y + rz*axY.z;  // meters from center along panel Y (+ = up)
                         float uv_u = (u_m + 0.5f * pRef.size.width)  / pRef.size.width;   // 0=left  1=right
                         float uv_v = 1.0f - (v_m + 0.5f * pRef.size.height) / pRef.size.height;  // 0=top   1=bottom (Android UI)
-                        if (pRef.isKeyboard) {
+                        if (pRef.isLauncher) {
+                            ALOGE("[rover-launcher] press pi=%d uv=(%.3f,%.3f)", useHit.panelIdx, uv_u, uv_v);
+                            CallHandleLauncherHit(androidApp, uv_u, uv_v);
+                        } else if (pRef.isDock) {
+                            ALOGE("[rover-dock] press pi=%d uv=(%.3f,%.3f)", useHit.panelIdx, uv_u, uv_v);
+                            CallHandleDockHit(androidApp, uv_u, uv_v);
+                        } else if (pRef.isKeyboard) {
                             // v0.7: keyboard panel — instant-fire via Kotlin dispatch, no tap-tracking.
                             ALOGE("[rover-kb] press pi=%d uv=(%.3f,%.3f)", useHit.panelIdx, uv_u, uv_v);
                             CallHandleKeyboardHit(androidApp, uv_u, uv_v);
@@ -2870,12 +3045,15 @@ int main() {
                                 g_sliderHand = hand;
                                 ALOGE("[rover-bar] slider grab start pi=%d", useHit.panelIdx);
                             } else if (act == 2) {
-                                // Hide: keep VD alive, just make panel invisible
-                                panelMgr.PanelAt(useHit.panelIdx).visible = false;
-                                ALOGE("[rover-bar] hide pi=%d", useHit.panelIdx);
+                                // v0.8.3 #8: Hide toggles bodyHidden; bar stays so user can restore
+                                bool& bh = panelMgr.PanelAt(useHit.panelIdx).bodyHidden;
+                                bh = !bh;
+                                ALOGE("[rover-bar] hide toggle pi=%d bodyHidden=%d", useHit.panelIdx, bh?1:0);
                             } else if (act == 3) {
-                                // DoF cycle: HeadLocked(0) -> YawLocked(3) -> BodyLocked(2) -> WorldAnchored(1) -> repeat
-                                rover::DofMode cur = panelMgr.PanelAt(useHit.panelIdx).dofMode;
+                                // v0.8.3 #2: DoF cycle — capture world pose then rebase for new mode
+                                rover::Panel& p = panelMgr.PanelAt(useHit.panelIdx);
+                                XrPosef curWorld = panelMgr.ResolveWorldPose(useHit.panelIdx, headInLocal);
+                                rover::DofMode cur = p.dofMode;
                                 rover::DofMode next;
                                 switch (cur) {
                                     case rover::DofMode::HeadLocked: next = rover::DofMode::YawLocked; break;
@@ -2883,8 +3061,9 @@ int main() {
                                     case rover::DofMode::BodyLocked: next = rover::DofMode::WorldAnchored; break;
                                     default: next = rover::DofMode::HeadLocked; break;
                                 }
-                                panelMgr.PanelAt(useHit.panelIdx).dofMode = next;
-                                ALOGE("[rover-bar] dof pi=%d cycled", useHit.panelIdx);
+                                p.dofMode = next;
+                                panelMgr.CommitWorldPose(useHit.panelIdx, curWorld, headInLocal);
+                                ALOGE("[rover-bar] dof cycled pi=%d (rebased)", useHit.panelIdx);
                             } else if (act >= 1) {
                                 ALOGE("[rover-bar] button pi=%d act=%d handled by Kotlin", useHit.panelIdx, act);
                             } else {
@@ -3000,7 +3179,7 @@ int main() {
             for (int pi = 0; pi < (int)panelMgr.Panels().size(); ++pi) {
                 const auto& pp = panelMgr.PanelAt(pi);
                 if (!pp.oesSourced) continue;
-                if (pp.isKeyboard) continue;  // kb has its own fixed-size render
+                if (pp.isKeyboard || pp.isDock || pp.isLauncher) continue;  // kb/dock/launcher fixed-size
                 ReflowState& st = refl[pi];
                 bool sizeChanged = (std::fabs(pp.size.width  - st.lastW) > eps) ||
                                    (std::fabs(pp.size.height - st.lastH) > eps);
@@ -3067,7 +3246,11 @@ int main() {
                     float baruv_u = (u_m + 0.5f * barW) / barW;
                     if (baruv_u < 0.f) baruv_u = 0.f; if (baruv_u > 1.f) baruv_u = 1.f;
                     CallUpdateBarSlider(androidApp, g_sliderPanelIdx, baruv_u);
-                    panelMgr.PanelAt(g_sliderPanelIdx).panelAlpha = baruv_u;
+                    // v0.8.3 #9: map bar-u to slider value using the same range Kotlin uses
+                    // BarTexture.SLIDER_START=0.42, SLIDER_END=0.70
+                    float sv = (baruv_u - 0.42f) / (0.70f - 0.42f);
+                    if (sv < 0.0f) sv = 0.0f; if (sv > 1.0f) sv = 1.0f;
+                    panelMgr.PanelAt(g_sliderPanelIdx).panelAlpha = sv;
                 }
             }
         }
@@ -3160,7 +3343,7 @@ int main() {
                     if (cy < 0) cy = 0; if (cy >= p.height) cy = p.height - 1;
                     // Swipe from (cx, cy - delta) to (cx, cy + delta), sy>0 = up on stick = scroll UP page = touch swipes DOWN (natural)
                     // Ensure delta always > tap-threshold so Android sees swipe not tap
-                    int delta = (int)(sy * 400.0f);
+                    int delta = (int)(sy * 200.0f);  // v0.8.3 #10: halved for slower feel
                     int minDelta = 120; if (sy > 0) { if (delta < minDelta) delta = minDelta; } else { if (delta > -minDelta) delta = -minDelta; }
                     int y1 = cy - delta / 2;
                     int y2 = cy + delta / 2;
@@ -3238,6 +3421,8 @@ int main() {
             CallUpdateKbSurfaceTexImage(androidApp);
             CallUpdateAllHostedTexImages(androidApp);
             CallUpdateAllBarTexImages(androidApp);
+            CallUpdateDockSurfaceTexImage(androidApp);
+            CallUpdateLauncherSurfaceTexImage(androidApp);
 for (int pi = 0; pi < (int)panelMgr.Panels().size(); pi++) {
                     if (panelMgr.PanelAt(pi).oesSourced) {
                         float kStMat[16]; bool haveMat = CallGetSTMatrixForPanel(androidApp, (int)pi, kStMat);

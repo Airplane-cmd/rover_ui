@@ -45,11 +45,15 @@ struct Panel {
     bool oesSourced = false;   // if true, sourced from a GL_TEXTURE_EXTERNAL_OES via OesBlitter
     unsigned int oesTextureId = 0;  // per-panel OES tex; 0 falls back to caller-supplied default
     bool isKeyboard = false;   // if true, hit-tests dispatch to KeyboardTexture (via JNI) instead of tap injection
+    bool isDock = false;       // v0.9: persistent 3DoF dock — always visible, no bar, excluded from grip-rotate
+    bool isLauncher = false;   // v0.9.2: app-launcher grid — no bar, excluded from grip-rotate
     bool visible = true;       // v0.7.2: false = skip in layer build + hit-test (hide keyboard)
     bool oesForceOpaque = true; // v0.7.2: false = OES blit preserves source alpha
     unsigned int barOesTexId = 0;   // v0.8-1b: if !=0, bar renders from Kotlin-drawn OES tex
     float panelAlpha = 1.0f;        // v0.8-1b: multiplied into OES output alpha via shader uniform
     bool pendingHeadAlign = false; // v0.8-fix-dof: on first frame, rewrite pose from head
+    bool bodyHidden = false;      // v0.8.3 #8: hide body quad but keep bar (toggle via Hide btn)
+    bool dead = false;             // v0.8.4 #14: resources destroyed, slot inert
 };
 
 // Ray-cast hit result
@@ -95,6 +99,7 @@ public:
 
     const std::vector<Panel>& Panels() const { return panels_; }
     Panel& PanelAt(int idx) { return panels_[idx]; }
+    void DestroyPanelResources(int idx);  // v0.8.4 #14: free swapchains, mark dead
 
     // Destroy + recreate a panel's swapchain at new pixel dimensions.
     // Returns true on success. Updates p.width/p.height.

@@ -132,11 +132,173 @@ object RoverBridge {
         try { app.surface.release() } catch (_: Throwable) { }
         try { app.st.release() } catch (_: Throwable) { }
         hostedApps.remove(app)
-        Log.i(TAG, "closed panel=$panelIdx (${app.pkg})")
+        // v0.8.3 #12: clear keyboard's target if we just closed it
+        if (lastTappedOesDisplayId == app.vdId) lastTappedOesDisplayId = -1
+        // v0.8.3 #14: release bar Surface/SurfaceTexture too
+        bars.remove(panelIdx)?.let { bar ->
+            try { bar.surface.release() } catch (_: Throwable) { }
+            try { bar.st.release() } catch (_: Throwable) { }
+        }
+        Log.i(TAG, "closed panel=$panelIdx (${app.pkg}), bar+VD+ST released")
     }
 
     /** For native placement: returns the current hosted app count. */
     @JvmStatic fun hostedAppCount(): Int = hostedApps.size
+
+    // ============ v0.9: persistent dock ============
+    @Volatile @JvmStatic var dockPanelIdx: Int = -1
+    @Volatile private var dockOesTexId: Int = 0
+    @Volatile private var dockSurfaceTexture: android.graphics.SurfaceTexture? = null
+    @Volatile private var dockSurface: Surface? = null
+
+    @JvmStatic
+    fun setDockOesTextureId(panelIdx: Int, id: Int) {
+        dockPanelIdx = panelIdx
+        dockOesTexId = id
+        val st = android.graphics.SurfaceTexture(id).apply {
+            setDefaultBufferSize(DockTexture.W, DockTexture.H)
+        }
+        dockSurfaceTexture = st
+        dockSurface = Surface(st)
+        renderDockToSurface()
+        // v0.9.1: 1Hz auto refresh so seconds tick
+        dockTicker.removeCallbacks(dockTickerRunnable)
+        dockTicker.postDelayed(dockTickerRunnable, 1000)
+    }
+
+    @JvmStatic
+    fun updateDockSurfaceTexImage(): Boolean {
+        val st = dockSurfaceTexture ?: return false
+        return try { st.updateTexImage(); true } catch (_: Throwable) { false }
+    }
+
+    private val dockTicker = android.os.Handler(android.os.Looper.getMainLooper())
+    private val dockTickerRunnable = object : Runnable {
+        override fun run() {
+            renderDockToSurface()
+            dockTicker.postDelayed(this, 1000)
+        }
+    }
+
+    private fun readBatteryPct(): Int {
+        val a = activity ?: return -1
+        return try {
+            val bm = a.getSystemService(Context.BATTERY_SERVICE) as android.os.BatteryManager
+            bm.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY)
+        } catch (_: Throwable) { -1 }
+    }
+
+    private fun renderDockToSurface() {
+        val surf = dockSurface ?: return
+        val now = java.util.Calendar.getInstance()
+        val timeStr = String.format("%02d:%02d:%02d",
+            now.get(java.util.Calendar.HOUR_OF_DAY),
+            now.get(java.util.Calendar.MINUTE),
+            now.get(java.util.Calendar.SECOND))
+        val pct = readBatteryPct()
+        val battStr = if (pct >= 0) "$pct%" else "—"
+        var canvas: android.graphics.Canvas? = null
+        try {
+            canvas = surf.lockCanvas(null)
+            canvas.drawColor(0, android.graphics.PorterDuff.Mode.CLEAR)
+            val bmp = android.graphics.Bitmap.createBitmap(DockTexture.W, DockTexture.H,
+                android.graphics.Bitmap.Config.ARGB_8888)
+            val pixels = DockTexture.render(timeStr, battStr)
+            bmp.copyPixelsFromBuffer(pixels)
+            canvas.drawBitmap(bmp, 0f, 0f, null)
+            bmp.recycle()
+        } catch (e: Throwable) {
+            Log.e(TAG, "renderDockToSurface failed", e)
+        } finally {
+            if (canvas != null) {
+                try { surf.unlockCanvasAndPost(canvas) } catch (_: Throwable) {}
+            }
+        }
+    }
+
+    /** Dispatch dock icon tap. Called by native on trigger-down over dock. */
+    @JvmStatic
+    fun handleDockHit(u: Float, v: Float) {
+        val act = DockTexture.hitAction(u)
+        Log.i(TAG, "dock hit u=$u act=$act")
+        when (act) {
+            1 -> toggleLauncherVisible()  // v0.9.2: opens app launcher grid
+            2 -> requestKbVisible(true)
+            3 -> { for (app in hostedApps.toList()) requestClose(app.panelIdx) }
+            4 -> Log.i(TAG, "dock status/settings tap (quick settings TBD)")
+        }
+    }
+
+    // ============ v0.9.2: launcher grid ============
+    @Volatile @JvmStatic var launcherPanelIdx: Int = -1
+    @Volatile private var launcherOesTexId: Int = 0
+    @Volatile private var launcherSurfaceTexture: android.graphics.SurfaceTexture? = null
+    @Volatile private var launcherSurface: Surface? = null
+    @Volatile @JvmStatic private var launcherVisReq: Int = -1
+
+    @JvmStatic
+    fun setLauncherOesTextureId(panelIdx: Int, id: Int) {
+        launcherPanelIdx = panelIdx
+        launcherOesTexId = id
+        val a = activity ?: return
+        LauncherTexture.loadApps(a)
+        val st = android.graphics.SurfaceTexture(id).apply {
+            setDefaultBufferSize(LauncherTexture.W, LauncherTexture.H)
+        }
+        launcherSurfaceTexture = st
+        launcherSurface = Surface(st)
+        renderLauncherToSurface()
+    }
+
+    @JvmStatic
+    fun updateLauncherSurfaceTexImage(): Boolean {
+        val st = launcherSurfaceTexture ?: return false
+        return try { st.updateTexImage(); true } catch (_: Throwable) { false }
+    }
+
+    @JvmStatic fun pollLauncherVisRequest(): Int { val r = launcherVisReq; launcherVisReq = -1; return r }
+    @JvmStatic fun requestLauncherVisible(v: Boolean) { launcherVisReq = if (v) 1 else 0 }
+    @JvmStatic fun toggleLauncherVisible() {
+        // Native holds truth; use -2 as "toggle" sentinel
+        launcherVisReq = -2
+    }
+
+    @JvmStatic
+    fun handleLauncherHit(u: Float, v: Float) {
+        val idx = LauncherTexture.hitTile(u, v)
+        when (idx) {
+            -1 -> return
+            -2 -> { LauncherTexture.prevPage(); renderLauncherToSurface(); return }
+            -3 -> { LauncherTexture.nextPage(); renderLauncherToSurface(); return }
+            else -> {
+                val app = LauncherTexture.appAt(idx) ?: return
+                Log.i(TAG, "launcher tile hit idx=$idx pkg=${app.pkg}")
+                requestSpawn(app.pkg, app.activity)
+                requestLauncherVisible(false)
+            }
+        }
+    }
+
+    private fun renderLauncherToSurface() {
+        val surf = launcherSurface ?: return
+        var canvas: android.graphics.Canvas? = null
+        try {
+            canvas = surf.lockCanvas(null)
+            canvas.drawColor(0, android.graphics.PorterDuff.Mode.CLEAR)
+            val bmp = android.graphics.Bitmap.createBitmap(LauncherTexture.W, LauncherTexture.H,
+                android.graphics.Bitmap.Config.ARGB_8888)
+            val pixels = LauncherTexture.render()
+            bmp.copyPixelsFromBuffer(pixels)
+            canvas.drawBitmap(bmp, 0f, 0f, null)
+            bmp.recycle()
+        } catch (e: Throwable) {
+            Log.e(TAG, "renderLauncherToSurface failed", e)
+        } finally {
+            if (canvas != null) {
+                try { surf.unlockCanvasAndPost(canvas) } catch (_: Throwable) {}
+            }
+        }
+    }
 
     /** Resize the underlying VD + surface buffer for a spawned panel. */
     @JvmStatic
@@ -166,9 +328,16 @@ object RoverBridge {
     @JvmStatic
     fun getStMatrixForPanel(panelIdx: Int, out: FloatArray): Boolean {
         if (out.size < 16) return false
-        // Check keyboard first — kb often is panelIdx 0 now that default panel is gone
         if (panelIdx == kbPanelIdx) {
             val st = kbSurfaceTexture
+            if (st != null) { st.getTransformMatrix(out); return true }
+        }
+        if (panelIdx == dockPanelIdx) {
+            val st = dockSurfaceTexture
+            if (st != null) { st.getTransformMatrix(out); return true }
+        }
+        if (panelIdx == launcherPanelIdx) {
+            val st = launcherSurfaceTexture
             if (st != null) { st.getTransformMatrix(out); return true }
         }
         if (panelIdx == 0) {
@@ -198,7 +367,7 @@ object RoverBridge {
         var appName: String,
         var hovered: Boolean = false,
         var alpha: Float = 1.0f,
-        var dofIdx: Int = 0
+        var dofIdx: Int = 2  // v0.8.3 #11: BodyLocked to match native default + cycle
     )
     private val bars = java.util.concurrent.ConcurrentHashMap<Int, BarState>()
     private val DOF_LABELS = arrayOf("H", "Y", "B", "W")  // HeadLocked, YawLocked, BodyLocked, WorldAnchored
@@ -273,8 +442,11 @@ object RoverBridge {
     }
 
     private fun renderBarSurface(bar: BarState) {
+        // v0.8.4 #13: try/finally so any throw between lockCanvas and unlockCanvasAndPost
+        // releases the lock; otherwise every later lockCanvas throws IllegalStateException.
+        var canvas: android.graphics.Canvas? = null
         try {
-            val canvas = bar.surface.lockCanvas(null)
+            canvas = bar.surface.lockCanvas(null)
             canvas.drawColor(0, android.graphics.PorterDuff.Mode.CLEAR)
             val bmp = android.graphics.Bitmap.createBitmap(BarTexture.W, BarTexture.H,
                 android.graphics.Bitmap.Config.ARGB_8888)
@@ -282,8 +454,13 @@ object RoverBridge {
             bmp.copyPixelsFromBuffer(pixels)
             canvas.drawBitmap(bmp, 0f, 0f, null)
             bmp.recycle()
-            bar.surface.unlockCanvasAndPost(canvas)
-        } catch (e: Throwable) { Log.e(TAG, "renderBarSurface failed", e) }
+        } catch (e: Throwable) {
+            Log.e(TAG, "renderBarSurface failed", e)
+        } finally {
+            if (canvas != null) {
+                try { bar.surface.unlockCanvasAndPost(canvas) } catch (_: Throwable) {}
+            }
+        }
     }
 
     @Volatile private var externalOesTexId: Int = 0
@@ -323,9 +500,10 @@ object RoverBridge {
 
     private fun renderKeyboardToSurface() {
         val surf = kbSurface ?: return
+        // v0.8.4 #13: try/finally so the surface never stays locked on throw
+        var canvas: android.graphics.Canvas? = null
         try {
-            val canvas = surf.lockCanvas(null)
-            // v0.7.2: clear surface to transparent first, so key-gap alpha propagates
+            canvas = surf.lockCanvas(null)
             canvas.drawColor(0, android.graphics.PorterDuff.Mode.CLEAR)
             val bmp = android.graphics.Bitmap.createBitmap(KeyboardTexture.width(), KeyboardTexture.height(),
                 android.graphics.Bitmap.Config.ARGB_8888)
@@ -333,8 +511,13 @@ object RoverBridge {
             bmp.copyPixelsFromBuffer(pixels)
             canvas.drawBitmap(bmp, 0f, 0f, null)
             bmp.recycle()
-            surf.unlockCanvasAndPost(canvas)
-        } catch (e: Throwable) { Log.e(TAG, "renderKeyboardToSurface failed", e) }
+        } catch (e: Throwable) {
+            Log.e(TAG, "renderKeyboardToSurface failed", e)
+        } finally {
+            if (canvas != null) {
+                try { surf.unlockCanvasAndPost(canvas) } catch (_: Throwable) {}
+            }
+        }
     }
 
     @JvmStatic

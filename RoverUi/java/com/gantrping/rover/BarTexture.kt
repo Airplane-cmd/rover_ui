@@ -33,11 +33,12 @@ object BarTexture {
 
     /** Compute action code for a hover-mode hit at u in [0..1]. */
     fun hitAction(u: Float): Int {
-        if (u < NAME_END) return 0
-        if (u >= SLIDER_START && u < SLIDER_END) return 4
-        if (u < BTN_HIDE_END) return 2
-        if (u < BTN_DOF_END) return 3
-        if (u < BTN_CLOSE_END) return 1
+        // v0.8.3 #7: only the button region maps to action; the blank gap is drag.
+        if (u < SLIDER_START) return 0                             // name / gap → drag
+        if (u < SLIDER_END) return 4                                // slider
+        if (u >= SLIDER_END && u < BTN_HIDE_END) return 2           // hide
+        if (u >= BTN_HIDE_END && u < BTN_DOF_END) return 3          // dof
+        if (u >= BTN_DOF_END && u < BTN_CLOSE_END) return 1         // close
         return 0
     }
 
