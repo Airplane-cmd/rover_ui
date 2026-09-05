@@ -2431,6 +2431,7 @@ int main() {
         {
             static int gripHand = 0;  // 0=none, 1=left, 2=right
             static XrQuaternionf gripCtrlStartInv = {0,0,0,1};
+            static XrQuaternionf prevCtrlOri = {0,0,0,1};  // v0.8.2/A3: session-scoped, reset on grip start
             static std::vector<XrPosef> capturedPose;
             static std::vector<XrVector3f> capturedHeadRel;   // panel - head at grip start
             static std::vector<bool> capturedValid;
@@ -2516,6 +2517,7 @@ int main() {
                 inertiaActive = false;
                 XrPosef ctrlPose = (gripHand == 1) ? leftCtrl : rightCtrl;
                 gripCtrlStartInv = qconj(ctrlPose.orientation);
+                prevCtrlOri = ctrlPose.orientation;  // v0.8.2/A3: baseline for this session
                 for (int pi = 0; pi < panelCount; pi++) {
                     const auto& pp = panelMgr.PanelAt(pi);
                     if (pp.isKeyboard) { capturedValid[pi] = false; continue; }
@@ -2537,6 +2539,14 @@ int main() {
                 bool stillHeld = (gripHand == 1) ? (leftGripState.currentState != XR_FALSE)
                                                  : (rightGripState.currentState != XR_FALSE);
                 if (!stillHeld) {
+                    // v0.8.2/A1: rebase head-relative offset to damped current position,
+                    // so inertia continues from where panels VISUALLY are.
+                    for (int pi = 0; pi < panelCount; pi++) {
+                        if (!capturedValid[pi]) continue;
+                        capturedHeadRel[pi] = {panelPos[pi].x - headInLocal.position.x,
+                                               panelPos[pi].y - headInLocal.position.y,
+                                               panelPos[pi].z - headInLocal.position.z};
+                    }
                     ALOGE("[rover-grip] RELEASE hand=%d -> inertia", gripHand);
                     inertiaActive = true;
                     gripHand = 0;
@@ -2545,7 +2555,6 @@ int main() {
                     // delta from initial press (for target pose)
                     XrQuaternionf deltaR = qmul2(ctrlPose.orientation, gripCtrlStartInv);
                     // per-frame controller delta (raw angular velocity source for post-release spin)
-                    static XrQuaternionf prevCtrlOri = ctrlPose.orientation;
                     XrQuaternionf ctrlFrameDelta = qmul2(ctrlPose.orientation, qconj(prevCtrlOri));
                     prevCtrlOri = ctrlPose.orientation;
                     for (int pi = 0; pi < panelCount; pi++) {
@@ -2577,51 +2586,28 @@ int main() {
                     panelPos[pi] = {headInLocal.position.x + capturedHeadRel[pi].x,
                                     headInLocal.position.y + capturedHeadRel[pi].y,
                                     headInLocal.position.z + capturedHeadRel[pi].z};
+                    // v0.8.2/A3: hemisphere-normalize before slerp so decay to identity works
+                    if (panelAngVel[pi].w < 0.0f) {
+                        panelAngVel[pi].x = -panelAngVel[pi].x;
+                        panelAngVel[pi].y = -panelAngVel[pi].y;
+                        panelAngVel[pi].z = -panelAngVel[pi].z;
+                        panelAngVel[pi].w = -panelAngVel[pi].w;
+                    }
                     XrQuaternionf ident = {0,0,0,1};
                     panelAngVel[pi] = qslerp(panelAngVel[pi], ident, 1.0f - FRICTION);
-                    if (std::fabs(1.0f - panelAngVel[pi].w) > VEL_STOP) anyMoving = true;
+                    // v0.8.2/A4: angle-based stop — 1 - |w| < VEL_STOP is scale-safe
+                    if ((1.0f - std::fabs(panelAngVel[pi].w)) > VEL_STOP) anyMoving = true;
                 }
                 if (!anyMoving) inertiaActive = false;
             }
 
-            // Apply interpolated pose to each non-kb panel (updates p.pose based on DofMode)
+            // v0.8.2/A2: apply interpolated world pose via CommitWorldPose — handles all
+            // four DofModes correctly (the hand-rolled switch got YawLocked wrong).
             if (gripHand != 0 || inertiaActive) {
                 for (int pi = 0; pi < panelCount; pi++) {
                     if (!capturedValid[pi]) continue;
-                    auto& pp = panelMgr.PanelAt(pi);
-                    // Convert interpolated world pose back into pp.pose per DofMode
-                    switch (pp.dofMode) {
-                        case rover::DofMode::WorldAnchored: {
-                            pp.pose.position = panelPos[pi];
-                            pp.pose.orientation = panelOrient[pi];
-                            break;
-                        }
-                        case rover::DofMode::BodyLocked: {
-                            pp.pose.position = {panelPos[pi].x - headInLocal.position.x,
-                                                panelPos[pi].y - headInLocal.position.y,
-                                                panelPos[pi].z - headInLocal.position.z};
-                            pp.pose.orientation = panelOrient[pi];
-                            break;
-                        }
-                        case rover::DofMode::HeadLocked: {
-                            // Convert world -> head local: p.pose = head^-1 * world_pose
-                            XrQuaternionf hInv = qconj(headInLocal.orientation);
-                            XrVector3f dp = {panelPos[pi].x - headInLocal.position.x,
-                                             panelPos[pi].y - headInLocal.position.y,
-                                             panelPos[pi].z - headInLocal.position.z};
-                            pp.pose.position = qrotV2(hInv, dp);
-                            pp.pose.orientation = qmul2(hInv, panelOrient[pi]);
-                            break;
-                        }
-                        case rover::DofMode::YawLocked: {
-                            // Approximate — treat like BodyLocked for grip
-                            pp.pose.position = {panelPos[pi].x - headInLocal.position.x,
-                                                panelPos[pi].y - headInLocal.position.y,
-                                                panelPos[pi].z - headInLocal.position.z};
-                            pp.pose.orientation = panelOrient[pi];
-                            break;
-                        }
-                    }
+                    XrPosef worldPose = {panelOrient[pi], panelPos[pi]};
+                    panelMgr.CommitWorldPose(pi, worldPose, headInLocal);
                 }
             }
         }
