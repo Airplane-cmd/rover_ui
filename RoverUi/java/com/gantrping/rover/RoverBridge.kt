@@ -55,7 +55,13 @@ object RoverBridge {
     @Volatile private var pendingCloseIdx: Int = -1
 
     /** Kotlin/BroadcastReceiver-side entry: request a new hosted-app window. */
-    @JvmStatic fun requestSpawn(pkg: String, activity: String) {
+    @Volatile private var pendingSpawnUrl: String = ""
+    @JvmStatic fun requestSpawnUrl(pkg: String, activity: String, url: String) {
+        pendingSpawnUrl = url
+        requestSpawn(pkg, activity)
+    }
+
+        @JvmStatic fun requestSpawn(pkg: String, activity: String) {
         Log.i(TAG, "requestSpawn $pkg/$activity queued")
         pendingSpawnPkgAct = "$pkg|$activity"
     }
@@ -106,7 +112,12 @@ object RoverBridge {
                 Log.i(TAG, "spawned panel=$panelIdx vd=$vdid tex=$oesTexId for $pkg")
                 hostedApps.add(HostedApp(panelIdx, vdid, vd, surf, st, oesTexId, pkg, act))
                 Thread { ensureInjectorRunning(); setDisplayImePolicy(vdid, 0) }.start()
-                launchAppOnDisplay(pkg, act, vdid)
+                val urlForThis = pendingSpawnUrl.also { pendingSpawnUrl = "" }
+                if (urlForThis.isNotBlank()) {
+                    launchAppOnDisplayWithUrl(pkg, act, vdid, urlForThis)
+                } else {
+                    launchAppOnDisplay(pkg, act, vdid)
+                }
             } catch (e: Throwable) {
                 Log.e(TAG, "onPanelSpawnedNative failed", e)
             }
@@ -263,7 +274,11 @@ object RoverBridge {
     @JvmStatic fun pollLauncherVisRequest(): Int { val r = launcherVisReq; launcherVisReq = -1; return r }
     @JvmStatic fun requestLauncherVisible(v: Boolean) { launcherVisReq = if (v) 1 else 0 }
     @JvmStatic fun toggleLauncherVisible() {
-        // Native holds truth; use -2 as "toggle" sentinel
+        // v0.9.5: reload apps on every open so newly installed apps show up
+        val a = activity
+        if (a != null) {
+            Thread { LauncherTexture.loadApps(a); a.runOnUiThread { renderLauncherToSurface() } }.start()
+        }
         launcherVisReq = -2
     }
 
@@ -690,6 +705,25 @@ object RoverBridge {
             surfaceTexture?.setDefaultBufferSize(width, height)
             Log.i(TAG, "resizeVirtualDisplay to ${width}x${height}@${dpi}dpi")
         } catch (e: Throwable) { Log.e(TAG, "resize failed", e) }
+    }
+
+    @JvmStatic
+    fun launchAppOnDisplayWithUrl(pkg: String, activityName: String, displayId: Int, url: String): Boolean {
+        Thread { ensureInjectorRunning() }.start()
+        launchedPackages.add(pkg)
+        // v0.9.6: force-stop so no existing task can be reused on primary display; then
+        // launch via root am with -p (package scope) so Firefox internally resolves to
+        // IntentReceiverActivity which owns the http/https VIEW filter. After force-stop
+        // its re-dispatch to HomeActivity has no existing task to revive -> stays on our display.
+        val safeUrl = url.replace("'", "").replace("\"", "")
+        val cmd = "am force-stop $pkg; " +
+                  "am start --display $displayId -f 0x10008000 " +
+                  "-a android.intent.action.VIEW -d '$safeUrl' " +
+                  "-p $pkg"
+        Log.i(TAG, "launchWithUrl: su -c \"$cmd\"")
+        return try {
+            Runtime.getRuntime().exec(arrayOf("su", "-c", cmd)).waitFor() == 0
+        } catch (e: Throwable) { Log.e(TAG, "launchWithUrl failed", e); false }
     }
 
     @JvmStatic

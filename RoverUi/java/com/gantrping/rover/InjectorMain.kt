@@ -182,8 +182,20 @@ object InjectorMain {
 
     private fun sendEvent(displayId: Int, action: Int, x: Float, y: Float, downTime: Long) {
         val eventTime = SystemClock.uptimeMillis()
-        val e = MotionEvent.obtain(downTime, eventTime, action, x, y, 0)
-        e.source = InputDevice.SOURCE_TOUCHSCREEN
+        val pp = MotionEvent.PointerProperties().apply {
+            id = 0
+            toolType = MotionEvent.TOOL_TYPE_FINGER
+        }
+        val pc = MotionEvent.PointerCoords().apply {
+            this.x = x; this.y = y
+            pressure = 1f; size = 1f
+        }
+        val e = MotionEvent.obtain(
+            downTime, eventTime, action, 1,
+            arrayOf(pp), arrayOf(pc),
+            0, 0, 1f, 1f, 0, 0,
+            InputDevice.SOURCE_TOUCHSCREEN, 0
+        )
         setDisplayIdMethod.invoke(e, displayId)
         injectMethod.invoke(im, e, INJECT_MODE_ASYNC)
         e.recycle()

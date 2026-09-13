@@ -413,7 +413,8 @@ void PanelManager::BuildLayers(XrCompositionLayerQuad* outQuads, int outCap, int
         if (p.dead) continue;
         if (!p.visible) continue;
         if (p.bodyHidden) continue;
-        if (p.isLauncher) continue;  // v0.9.3: draw launcher last for z-order on top
+        if (p.isLauncher) continue;  // v0.9.3: draw launcher last
+        if (p.isKeyboard) continue;  // v0.9.5: draw keyboard last too
         XrPosef world = ResolveWorldPose(i, headPoseInLocal);
         world.orientation = QNorm(world.orientation);
         if (!VecFinite(world.position)) continue;
@@ -429,11 +430,11 @@ void PanelManager::BuildLayers(XrCompositionLayerQuad* outQuads, int outCap, int
         q.size = p.size;
         q.pose = world;
     }
-    // v0.9.3: draw launcher body last so it z-orders above hosted panels
+    // v0.9.3/5: draw launcher + keyboard body last so they z-order above hosted panels
     for (int i = 0; i < static_cast<int>(panels_.size()); i++) {
         if (count >= outCap) break;
         const Panel& p = panels_[i];
-        if (!p.isLauncher || p.dead || !p.visible || p.bodyHidden) continue;
+        if (!(p.isLauncher || p.isKeyboard) || p.dead || !p.visible || p.bodyHidden) continue;
         XrPosef world = ResolveWorldPose(i, headPoseInLocal);
         world.orientation = QNorm(world.orientation);
         if (!VecFinite(world.position)) continue;

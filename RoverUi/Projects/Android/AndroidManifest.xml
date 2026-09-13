@@ -56,6 +56,7 @@
         <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
         <category android:name="android.intent.category.LAUNCHER" />
       </intent-filter>
+    
     </activity>
     <service
         android:name="com.gantrping.rover.MediaProjectionService"
@@ -72,5 +73,21 @@
           android:name="android.view.im"
           android:resource="@xml/ime" />
     </service>
-  </application>
+  
+        <activity
+            android:name="com.gantrping.rover.LinkHandlerActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:noHistory="true">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="http" />
+                <data android:scheme="https" />
+            </intent-filter>
+        </activity>
+    </application>
 </manifest>
