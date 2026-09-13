@@ -81,7 +81,9 @@ class RoverActivity : NativeActivity() {
 
     override fun onDestroy() {
         try { unregisterReceiver(cfgReceiver) } catch (_: Throwable) {}
-        RoverBridge.cleanupLaunchedApps()
+        // v0.9.3: only cleanup when user explicitly quits (isFinishing) — skip when Android
+        // destroys the activity to reclaim memory, which would kill hosted apps unexpectedly.
+        if (isFinishing) RoverBridge.cleanupLaunchedApps()
         RoverBridge.setActivity(null)
         // v0.8-fixes: re-enable all system IMEs (we disabled them at startup)
         Thread {
@@ -96,7 +98,9 @@ class RoverActivity : NativeActivity() {
     }
 
     override fun onStop() {
-        RoverBridge.cleanupLaunchedApps()
+        // v0.9.3: DO NOT cleanupLaunchedApps here — Meta shell briefly backgrounds rover
+        // during compositor rearrangement (e.g. closing a hosted VD), and force-stopping
+        // every hosted app would kill sibling panels. Cleanup stays only in onDestroy.
         super.onStop()
     }
 }

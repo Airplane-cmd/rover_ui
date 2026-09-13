@@ -406,13 +406,14 @@ void PanelManager::SetHovered(int panelIdx) {
 void PanelManager::BuildLayers(XrCompositionLayerQuad* outQuads, int outCap, int* outCount,
                                 const XrPosef& headPoseInLocal) {
     int count = 0;
-    // Panel bodies
+    // Panel bodies (launcher deferred to render last so it draws on top)
     for (int i = 0; i < static_cast<int>(panels_.size()); i++) {
         if (count >= outCap) break;
         const Panel& p = panels_[i];
-        if (p.dead) continue;         // v0.8.4 #14
+        if (p.dead) continue;
         if (!p.visible) continue;
-        if (p.bodyHidden) continue;  // v0.8.3 #8: bar still renders (below), body doesn't
+        if (p.bodyHidden) continue;
+        if (p.isLauncher) continue;  // v0.9.3: draw launcher last for z-order on top
         XrPosef world = ResolveWorldPose(i, headPoseInLocal);
         world.orientation = QNorm(world.orientation);
         if (!VecFinite(world.position)) continue;
@@ -428,6 +429,27 @@ void PanelManager::BuildLayers(XrCompositionLayerQuad* outQuads, int outCap, int
         q.size = p.size;
         q.pose = world;
     }
+    // v0.9.3: draw launcher body last so it z-orders above hosted panels
+    for (int i = 0; i < static_cast<int>(panels_.size()); i++) {
+        if (count >= outCap) break;
+        const Panel& p = panels_[i];
+        if (!p.isLauncher || p.dead || !p.visible || p.bodyHidden) continue;
+        XrPosef world = ResolveWorldPose(i, headPoseInLocal);
+        world.orientation = QNorm(world.orientation);
+        if (!VecFinite(world.position)) continue;
+        XrCompositionLayerQuad& q = outQuads[count++];
+        q = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+        q.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+        q.space = localSpace_;
+        q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+        q.subImage.swapchain = p.swapchain;
+        q.subImage.imageRect.offset = {0, 0};
+        q.subImage.imageRect.extent = {p.width, p.height};
+        q.subImage.imageArrayIndex = 0;
+        q.size = p.size;
+        q.pose = world;
+    }
+
     // Display bars — v0.8-1b: hover-expanded, sourced from OES when available
     for (int i = 0; i < static_cast<int>(panels_.size()); i++) {
         if (count >= outCap) break;

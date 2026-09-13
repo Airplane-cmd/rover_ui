@@ -2372,21 +2372,16 @@ int main() {
         {
             bool cur = (rightBButtonState.type != 0 && rightBButtonState.currentState != XR_FALSE);
             if (cur && !prevCaptureBtn) {
-                ALOGE("[rover] Right B pressed — request spawn Termux (multi-VD)");
-                // v0.8-1a: use spawn API to create a NEW hosted window each press
+                ALOGE("[rover] Right B pressed — toggle launcher");
                 JavaVM* jvm = androidApp->activity->vm; JNIEnv* env = nullptr;
                 jvm->AttachCurrentThread(&env, nullptr);
                 if (env) {
                     CacheBridgeClass(androidApp, env);
                     if (g_bridgeCls) {
-                        jmethodID m = env->GetStaticMethodID(g_bridgeCls, "requestSpawn",
-                            "(Ljava/lang/String;Ljava/lang/String;)V");
+                        jmethodID m = env->GetStaticMethodID(g_bridgeCls, "toggleLauncherVisible", "()V");
                         if (m) {
-                            jstring jp = env->NewStringUTF("com.termux");
-                            jstring ja = env->NewStringUTF("com.termux.app.TermuxActivity");
-                            env->CallStaticVoidMethod(g_bridgeCls, m, jp, ja);
+                            env->CallStaticVoidMethod(g_bridgeCls, m);
                             if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
-                            env->DeleteLocalRef(jp); env->DeleteLocalRef(ja);
                         } else { env->ExceptionClear(); }
                     }
                 }
@@ -2460,10 +2455,20 @@ int main() {
                 glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
                 glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
 
-                // Placement: head-relative offset -> world pose captured at spawn time,
-                // so BodyLocked panels keep their orientation once placed.
-                static float g_spawnCursorX = -0.6f;
-                g_spawnCursorX += 0.8f;
+                // v0.9.3: alternating placement around center. Spawn N -> x offset:
+                //   0->0, 1->-0.6, 2->+0.6, 3->-1.2, 4->+1.2, ...
+                int liveHosted = 0;
+                for (int i = 0; i < (int)panelMgr.Panels().size(); i++) {
+                    const auto& pp = panelMgr.PanelAt(i);
+                    if (pp.oesSourced && !pp.isKeyboard && !pp.isDock && !pp.isLauncher
+                        && !pp.dead && pp.visible) liveHosted++;
+                }
+                float g_spawnCursorX;
+                if (liveHosted == 0) g_spawnCursorX = 0.0f;
+                else {
+                    int magnitude = (liveHosted + 1) / 2;
+                    g_spawnCursorX = ((liveHosted % 2 == 1) ? -0.6f : 0.6f) * magnitude;
+                }
                 auto qrotV = [](const XrQuaternionf& q, XrVector3f v) {
                     float x=q.x,y=q.y,z=q.z,w=q.w;
                     float ix =  w*v.x + y*v.z - z*v.y;
@@ -2507,7 +2512,7 @@ int main() {
                 g_pendingKills.push_back({closeIdx,
                                           panelMgr.PanelAt(closeIdx).oesTextureId,
                                           panelMgr.PanelAt(closeIdx).barOesTexId,
-                                          3});
+                                          30});
                 panelMgr.PanelAt(closeIdx).visible = false;
                 panelMgr.PanelAt(closeIdx).dead = true;
                 CallOnPanelClosedNative(androidApp, closeIdx);
@@ -3245,11 +3250,10 @@ int main() {
                     float barW = panelMgr.PanelAt(g_sliderPanelIdx).size.width;
                     float baruv_u = (u_m + 0.5f * barW) / barW;
                     if (baruv_u < 0.f) baruv_u = 0.f; if (baruv_u > 1.f) baruv_u = 1.f;
-                    CallUpdateBarSlider(androidApp, g_sliderPanelIdx, baruv_u);
-                    // v0.8.3 #9: map bar-u to slider value using the same range Kotlin uses
-                    // BarTexture.SLIDER_START=0.42, SLIDER_END=0.70
+                    // v0.9.3: map bar-u once and pass the same value to Kotlin + native
                     float sv = (baruv_u - 0.42f) / (0.70f - 0.42f);
                     if (sv < 0.0f) sv = 0.0f; if (sv > 1.0f) sv = 1.0f;
+                    CallUpdateBarSlider(androidApp, g_sliderPanelIdx, sv);
                     panelMgr.PanelAt(g_sliderPanelIdx).panelAlpha = sv;
                 }
             }

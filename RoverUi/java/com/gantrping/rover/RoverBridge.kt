@@ -125,20 +125,24 @@ object RoverBridge {
     @JvmStatic
     fun onPanelClosedNative(panelIdx: Int) {
         val app = hostedApps.firstOrNull { it.panelIdx == panelIdx } ?: return
-        try {
-            Runtime.getRuntime().exec(arrayOf("su", "-c", "am force-stop ${app.pkg}"))
-        } catch (_: Throwable) { }
-        try { app.vd.release() } catch (_: Throwable) { }
-        try { app.surface.release() } catch (_: Throwable) { }
-        try { app.st.release() } catch (_: Throwable) { }
+        // v0.9.3: unlink from active state immediately so no more updateTexImage /
+        // hit-routing hits this panel — but defer the actual VD/Surface/ST release so
+        // Meta compositor can drain in-flight submissions without cascading its own
+        // task-close into sibling VDs.
         hostedApps.remove(app)
-        // v0.8.3 #12: clear keyboard's target if we just closed it
+        val bar = bars.remove(panelIdx)
         if (lastTappedOesDisplayId == app.vdId) lastTappedOesDisplayId = -1
-        // v0.8.3 #14: release bar Surface/SurfaceTexture too
-        bars.remove(panelIdx)?.let { bar ->
-            try { bar.surface.release() } catch (_: Throwable) { }
-            try { bar.st.release() } catch (_: Throwable) { }
-        }
+        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            try { Runtime.getRuntime().exec(arrayOf("su", "-c", "am force-stop ${app.pkg}")) } catch (_: Throwable) {}
+            try { app.vd.release() } catch (_: Throwable) {}
+            try { app.surface.release() } catch (_: Throwable) {}
+            try { app.st.release() } catch (_: Throwable) {}
+            bar?.let {
+                try { it.surface.release() } catch (_: Throwable) {}
+                try { it.st.release() } catch (_: Throwable) {}
+            }
+            Log.i(TAG, "deferred release complete pi=$panelIdx")
+        }, 700)
         Log.i(TAG, "closed panel=$panelIdx (${app.pkg}), bar+VD+ST released")
     }
 
