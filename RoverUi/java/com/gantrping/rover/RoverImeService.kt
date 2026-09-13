@@ -8,8 +8,8 @@ import android.widget.LinearLayout
 
 /**
  * Invisible IME service. Framework needs an IME to bind for text input to work.
- * We return an empty 0-height view so nothing renders on screen. All actual typing
- * happens via our XR keyboard panel calling this service's currentInputConnection.
+ * v0.9.1: aggressive "no keyboard needed" hints so Meta's ShellApp doesn't respond
+ * to our onStartInput by opening its overlay keyboard + FocusPlaceholderActivity.
  */
 class RoverImeService : InputMethodService() {
 
@@ -17,22 +17,16 @@ class RoverImeService : InputMethodService() {
         private const val TAG = "RoverImeService"
         @Volatile @JvmStatic var instance: RoverImeService? = null
 
-        /** Called from anywhere in rover_ui process — commits text to focused editor. */
         @JvmStatic
         fun commit(text: String): Boolean {
             val ic = instance?.currentInputConnection ?: run {
                 Log.w(TAG, "commit('$text') dropped: no service/connection")
                 return false
             }
-            return try {
-                ic.commitText(text, 1)
-                true
-            } catch (e: Throwable) {
-                Log.e(TAG, "commit failed", e); false
-            }
+            return try { ic.commitText(text, 1); true }
+            catch (e: Throwable) { Log.e(TAG, "commit failed", e); false }
         }
 
-        /** Send a raw KeyEvent (backspace, enter, arrows, etc). */
         @JvmStatic
         fun sendKey(keycode: Int): Boolean {
             val ic = instance?.currentInputConnection ?: return false
@@ -40,9 +34,7 @@ class RoverImeService : InputMethodService() {
                 ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keycode))
                 ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keycode))
                 true
-            } catch (e: Throwable) {
-                Log.e(TAG, "sendKey failed", e); false
-            }
+            } catch (e: Throwable) { Log.e(TAG, "sendKey failed", e); false }
         }
     }
 
@@ -54,15 +46,24 @@ class RoverImeService : InputMethodService() {
 
     override fun onCreateInputView(): View {
         Log.i(TAG, "onCreateInputView (returning empty invisible view)")
-        // 0-height LinearLayout — framework thinks IME exists but nothing shows
         return LinearLayout(this).apply {
             layoutParams = android.view.ViewGroup.LayoutParams(0, 0)
         }
     }
 
+    override fun onEvaluateInputViewShown(): Boolean = false
+
+    override fun onEvaluateFullscreenMode(): Boolean = false
+
     override fun onStartInput(attribute: android.view.inputmethod.EditorInfo?, restarting: Boolean) {
         super.onStartInput(attribute, restarting)
         Log.i(TAG, "onStartInput restarting=$restarting package=${attribute?.packageName}")
+        try { requestHideSelf(0) } catch (e: Throwable) { Log.w(TAG, "requestHideSelf failed", e) }
+    }
+
+    override fun onStartInputView(info: android.view.inputmethod.EditorInfo?, restarting: Boolean) {
+        super.onStartInputView(info, restarting)
+        try { requestHideSelf(0) } catch (_: Throwable) {}
     }
 
     override fun onDestroy() {
