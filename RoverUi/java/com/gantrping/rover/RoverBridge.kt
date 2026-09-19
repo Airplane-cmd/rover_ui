@@ -50,12 +50,119 @@ object RoverBridge {
         val activity: String
     )
     @JvmStatic private val hostedApps = java.util.concurrent.CopyOnWriteArrayList<HostedApp>()
+    private const val VIRTUAL_DISPLAY_FLAG_DESTROY_CONTENT_ON_REMOVAL = 1 shl 8
+
+    /** True if a panel other than [displayId] hosts [pkg]; force-stopping would kill it. */
+    private fun pkgHostedElsewhere(pkg: String, displayId: Int) =
+        hostedApps.any { it.pkg == pkg && it.vdId != displayId }
 
     @Volatile private var pendingSpawnPkgAct: String? = null
     @Volatile private var pendingCloseIdx: Int = -1
 
     /** Kotlin/BroadcastReceiver-side entry: request a new hosted-app window. */
     @Volatile private var pendingSpawnUrl: String = ""
+    @Volatile private var pendingSpawnIntent: android.content.Intent? = null
+    @Volatile private var pendingSpawnMultiTask = false
+    @Volatile private var pendingAdoptPkg: String? = null
+
+    /** An app opened a window on its own (e.g. Chrome "move to new window"): give it a panel. */
+    @JvmStatic fun requestAdopt(pkg: String) {
+        Log.i(TAG, "requestAdopt $pkg")
+        pendingAdoptPkg = pkg
+        requestSpawn(pkg, "")
+    }
+
+    /** Move the newest [pkg] task living outside rover's panels onto [displayId]. */
+    private data class TaskLoc(val taskId: Int, val rootId: Int, val displayId: Int)
+
+    private fun listPkgTasks(pkg: String): List<TaskLoc> {
+        val rootRe = Regex("""^RootTask id=(\d+) .*displayId=(\d+)""")
+        val taskRe = Regex("""^\s+taskId=(\d+): ${Regex.escape(pkg)}/""")
+        val out = ArrayList<TaskLoc>()
+        var rootId = -1; var rootDisplay = -1
+        try {
+            val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "am stack list"))
+            p.inputStream.bufferedReader().forEachLine { line ->
+                rootRe.find(line)?.let {
+                    rootId = it.groupValues[1].toInt(); rootDisplay = it.groupValues[2].toInt()
+                }
+                taskRe.find(line)?.let { out.add(TaskLoc(it.groupValues[1].toInt(), rootId, rootDisplay)) }
+            }
+            p.waitFor()
+        } catch (e: Throwable) { Log.e(TAG, "listPkgTasks failed", e) }
+        return out
+    }
+
+    /**
+     * Meta's shell re-parents some starts (e.g. Chrome's trampolines, "new window") onto its own
+     * displays. Pull the newest [pkg] task living outside rover panels (and not in [before]) onto
+     * [displayId]. With [panelIdx] >= 0 the panel is closed if nothing shows up.
+     */
+    private fun adoptTask(pkg: String, displayId: Int, panelIdx: Int, before: Set<Int>?, tries: Int) {
+        repeat(tries) {
+            val ours = hostedApps.map { it.vdId }.toSet()
+            val stray = listPkgTasks(pkg)
+                .filter { it.displayId !in ours && (before == null || it.taskId !in before) }
+                .maxByOrNull { it.taskId }
+            if (stray != null) {
+                Log.i(TAG, "adopt: moving task ${stray.taskId} (root ${stray.rootId}, display ${stray.displayId}) to $displayId")
+                Runtime.getRuntime().exec(arrayOf("su", "-c", "am display move-stack ${stray.rootId} $displayId")).waitFor()
+                return
+            }
+            Thread.sleep(100)
+        }
+        if (panelIdx >= 0) {
+            Log.w(TAG, "adopt: no new $pkg task found; closing panel $panelIdx")
+            requestClose(panelIdx)
+        }
+    }
+
+    @JvmStatic fun setRouting(on: Boolean) {
+        Thread {
+            ensureInjectorRunning()
+            sendInject("ROUTE ${if (on) 1 else 0} ${android.os.Process.myPid()}")
+        }.start()
+    }
+
+    /** Called with a start the injector vetoed; re-issue it into a rover panel. */
+    @JvmStatic fun routeIntent(uri: String, origPkg: String, newWindow: Boolean) {
+        val parsed = try { android.content.Intent.parseUri(uri, android.content.Intent.URI_INTENT_SCHEME) }
+                catch (e: Throwable) { Log.e(TAG, "routeIntent: bad uri $uri", e); return }
+        // Meta's browser is the system fallback for web links; route those to Chrome instead.
+        val toChrome = origPkg == "com.oculus.browser"
+        val pkg = if (toChrome) "com.android.chrome" else origPkg
+        val i = if (toChrome) parsed.apply { component = null; setPackage(pkg) } else parsed
+        val existing = hostedApps.lastOrNull { it.pkg == pkg }
+        Log.i(TAG, "routeIntent pkg=$pkg newWindow=$newWindow existing=${existing?.vdId} uri=$uri")
+        if (!newWindow && existing != null) {
+            Thread { launchIntentOnDisplay(i, pkg, existing.vdId, false) }.start()
+        } else {
+            pendingSpawnIntent = i
+            pendingSpawnMultiTask = newWindow
+            requestSpawn(pkg, i.component?.className ?: "")
+        }
+    }
+
+    @JvmStatic
+    fun launchIntentOnDisplay(i: android.content.Intent, pkg: String, displayId: Int, multiTask: Boolean): Boolean {
+        ensureInjectorRunning()
+        sendInject("EXEMPT $pkg")
+        launchedPackages.add(pkg)
+        val cmd = StringBuilder("am start --display $displayId -f ")
+            .append(if (multiTask) "0x18001000" else "0x10000000")
+        i.action?.let { cmd.append(" -a $it") }
+        i.dataString?.let { cmd.append(" -d '").append(it.replace("'", "")).append("'") }
+        i.categories?.forEach { cmd.append(" -c $it") }
+        val cmp = i.component
+        if (cmp != null) cmd.append(" -n ${cmp.flattenToShortString()}") else cmd.append(" -p $pkg")
+        Log.i(TAG, "launchIntentOnDisplay: su -c \"$cmd\"")
+        val before = listPkgTasks(pkg).map { it.taskId }.toSet()
+        val ok = try {
+            Runtime.getRuntime().exec(arrayOf("su", "-c", cmd.toString())).waitFor() == 0
+        } catch (e: Throwable) { Log.e(TAG, "launchIntentOnDisplay failed", e); false }
+        adoptTask(pkg, displayId, -1, before, 20)
+        return ok
+    }
     @JvmStatic fun requestSpawnUrl(pkg: String, activity: String, url: String) {
         pendingSpawnUrl = url
         requestSpawn(pkg, activity)
@@ -106,14 +213,23 @@ object RoverBridge {
                 val dm = a.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
                 val flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
                             DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION or
-                            DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
+                            DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY or
+                            VIRTUAL_DISPLAY_FLAG_DESTROY_CONTENT_ON_REMOVAL
                 val vd = dm.createVirtualDisplay("rover-panel-$panelIdx", w, h, VD_DPI, surf, flags)
                 val vdid = vd.display?.displayId ?: -1
                 Log.i(TAG, "spawned panel=$panelIdx vd=$vdid tex=$oesTexId for $pkg")
                 hostedApps.add(HostedApp(panelIdx, vdid, vd, surf, st, oesTexId, pkg, act))
                 Thread { ensureInjectorRunning(); setDisplayImePolicy(vdid, 0) }.start()
                 val urlForThis = pendingSpawnUrl.also { pendingSpawnUrl = "" }
-                if (urlForThis.isNotBlank()) {
+                val intentForThis = pendingSpawnIntent.also { pendingSpawnIntent = null }
+                val adoptForThis = pendingAdoptPkg.also { pendingAdoptPkg = null }
+                if (adoptForThis != null) {
+                    launchedPackages.add(pkg)
+                    Thread { adoptTask(adoptForThis, vdid, panelIdx, null, 30) }.start()
+                } else if (intentForThis != null) {
+                    val multi = pendingSpawnMultiTask
+                    Thread { launchIntentOnDisplay(intentForThis, pkg, vdid, multi) }.start()
+                } else if (urlForThis.isNotBlank()) {
                     launchAppOnDisplayWithUrl(pkg, act, vdid, urlForThis)
                 } else {
                     launchAppOnDisplay(pkg, act, vdid)
@@ -144,7 +260,9 @@ object RoverBridge {
         val bar = bars.remove(panelIdx)
         if (lastTappedOesDisplayId == app.vdId) lastTappedOesDisplayId = -1
         android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-            try { Runtime.getRuntime().exec(arrayOf("su", "-c", "am force-stop ${app.pkg}")) } catch (_: Throwable) {}
+            if (!pkgHostedElsewhere(app.pkg, app.vdId)) {
+                try { Runtime.getRuntime().exec(arrayOf("su", "-c", "am force-stop ${app.pkg}")) } catch (_: Throwable) {}
+            }
             try { app.vd.release() } catch (_: Throwable) {}
             try { app.surface.release() } catch (_: Throwable) {}
             try { app.st.release() } catch (_: Throwable) {}
@@ -716,8 +834,10 @@ object RoverBridge {
         // launch via root am with -p (package scope) so Firefox internally resolves to
         // IntentReceiverActivity which owns the http/https VIEW filter. After force-stop
         // its re-dispatch to HomeActivity has no existing task to revive -> stays on our display.
+        sendInject("EXEMPT $pkg")
         val safeUrl = url.replace("'", "").replace("\"", "")
-        val cmd = "am force-stop $pkg; " +
+        val stop = if (pkgHostedElsewhere(pkg, displayId)) "" else "am force-stop $pkg; "
+        val cmd = stop +
                   "am start --display $displayId -f 0x10008000 " +
                   "-a android.intent.action.VIEW -d '$safeUrl' " +
                   "-p $pkg"
@@ -730,8 +850,12 @@ object RoverBridge {
     @JvmStatic
     fun launchAppOnDisplay(pkg: String, activityName: String, displayId: Int): Boolean {
         Thread { ensureInjectorRunning() }.start()
+        ensureInjectorRunning()
+        sendInject("EXEMPT $pkg")
         val cmp = "$pkg/$activityName"
-        val cmd = "am force-stop $pkg; am start --display $displayId -f 0x10008000 -n $cmp"
+        val stop = if (pkgHostedElsewhere(pkg, displayId)) "" else "am force-stop $pkg; "
+        val flags = if (stop.isEmpty()) "0x18000000" else "0x10008000"
+        val cmd = "${stop}am start --display $displayId -f $flags -n $cmp"
         launchedPackages.add(pkg)
         Log.i(TAG, "launchAppOnDisplay: su -c \"$cmd\"")
         return try {

@@ -85,20 +85,6 @@
           android:resource="@xml/ime" />
     </service>
   
-        <activity
-            android:name="com.gantrping.rover.LinkHandlerActivity"
-            android:exported="true"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar"
-            android:excludeFromRecents="true"
-            android:taskAffinity=""
-            android:noHistory="true">
-            <intent-filter>
-                <action android:name="android.intent.action.VIEW" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="http" />
-                <data android:scheme="https" />
-            </intent-filter>
-        </activity>
+
     </application>
 </manifest>

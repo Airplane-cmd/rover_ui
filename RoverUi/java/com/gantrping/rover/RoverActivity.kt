@@ -34,6 +34,12 @@ class RoverActivity : NativeActivity() {
                     Log.i("RoverBridge", "INJECT_KEY did=$did kc=$kc")
                     if (did >= 0 && kc >= 0) Thread { RoverBridge.injectKey(did, kc) }.start()
                 }
+                "com.gantrping.rover.ROUTE" -> {
+                    val uri = intent.getStringExtra("uri") ?: return
+                    val pkg = intent.getStringExtra("pkg") ?: return
+                    if (intent.getBooleanExtra("adopt", false)) RoverBridge.requestAdopt(pkg)
+                    else RoverBridge.routeIntent(uri, pkg, intent.getBooleanExtra("newWindow", false))
+                }
                 "com.gantrping.rover.KB_TYPE" -> {
                     val txt = intent.getStringExtra("text") ?: ""
                     Log.i("RoverBridge", "KB_TYPE text='$txt' instance=${RoverImeService.instance != null}")
@@ -52,16 +58,6 @@ class RoverActivity : NativeActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         RoverBridge.setActivity(this)
-        // v0.9.6: register rover as default browser so link clicks route back to us
-        Thread {
-            try {
-                Runtime.getRuntime().exec(arrayOf("su", "-c",
-                    "cmd role add-role-holder android.role.BROWSER com.gantrping.rover")).waitFor()
-                Log.i("RoverBridge", "browser role acquired")
-            } catch (e: Throwable) { Log.e("RoverBridge", "browser role set failed", e) }
-        }.start()
-        // v0.9.6: handle any VIEW intent the activity was started with
-        handleViewIntent(intent)
         // v0.7.5: enable+set our IME AND disable Meta's phantom keyboard IME so it can never bind.
         // Meta's IME is what spawns the invisible panel that ate our clicks in Termux.
         // We re-enable it on onDestroy so the system still works after rover_ui exits.
@@ -89,6 +85,7 @@ class RoverActivity : NativeActivity() {
             addAction("com.gantrping.rover.INJECT_KEY")
             addAction("com.gantrping.rover.INJECT_TEXT")
             addAction("com.gantrping.rover.KB_TYPE")
+            addAction("com.gantrping.rover.ROUTE")
         }
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(cfgReceiver, filter, Context.RECEIVER_EXPORTED)
@@ -126,15 +123,13 @@ class RoverActivity : NativeActivity() {
         super.onStop()
     }
 
-    override fun onNewIntent(intent: android.content.Intent?) {
-        super.onNewIntent(intent)
-        handleViewIntent(intent)
+    override fun onResume() {
+        super.onResume()
+        RoverBridge.setRouting(true)
     }
 
-    private fun handleViewIntent(intent: android.content.Intent?) {
-        if (intent?.action != android.content.Intent.ACTION_VIEW) return
-        val url = intent.dataString ?: return
-        Log.i("RoverBridge", "VIEW intent url=$url -> spawning firefox")
-        RoverBridge.requestSpawnUrl("org.mozilla.firefox", "org.mozilla.fenix.IntentReceiverActivity", url)
+    override fun onPause() {
+        RoverBridge.setRouting(false)
+        super.onPause()
     }
 }

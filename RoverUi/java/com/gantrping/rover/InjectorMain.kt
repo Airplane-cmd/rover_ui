@@ -36,6 +36,13 @@ object InjectorMain {
     // Track down-time per hand so MOVE/UP link back to the correct gesture
     private var downTimeMs: Long = 0L
 
+    private val BROWSERS = setOf("com.android.chrome", "org.mozilla.firefox")
+    @Volatile private var routeOn = false
+    @Volatile private var roverPid = -1
+    private val exemptUntil = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    @Volatile private var lastRoutedUri = ""
+    @Volatile private var lastRoutedAt = 0L
+
     private var wms: Any? = null
     private var setImePolicyMethod: java.lang.reflect.Method? = null
 
@@ -75,6 +82,8 @@ object InjectorMain {
             } catch (e: Throwable) {
                 log("WMS setup failed: ${e.message}")
             }
+            ActivityRouter.onStarting = ::routeStart
+            ActivityRouter.install()
             log("started; im=${im.javaClass.name}")
 
             val server = LocalServerSocket(SOCKET_NAME)
@@ -172,6 +181,12 @@ object InjectorMain {
                     val text = line.substringAfter(parts[0]).substringAfter(parts[1]).trim()
                     injectText(did, text)
                 }
+                "ROUTE" -> {
+                    routeOn = parts[1] == "1"
+                    if (parts.size >= 3) roverPid = parts[2].toInt()
+                    log("ROUTE on=$routeOn pid=$roverPid")
+                }
+                "EXEMPT" -> exemptUntil[parts[1]] = SystemClock.uptimeMillis() + 3000
                 "PING" -> { out.write("PONG\n".toByteArray()); out.flush() }
                 else -> log("unknown cmd: $line")
             }
@@ -231,6 +246,34 @@ object InjectorMain {
             } catch (_: Throwable) {}
             injectMethod.invoke(im, e, 0)
         }
+    }
+
+    // Runs under the ATM lock (binder thread): decide fast, hand work off to another thread.
+    private fun routeStart(i: android.content.Intent, pkg: String): Boolean {
+        if (!routeOn || roverPid <= 0 || !java.io.File("/proc/$roverPid").exists()) return true
+        if (pkg == "com.gantrping.rover") return true
+        if ((exemptUntil[pkg] ?: 0L) > SystemClock.uptimeMillis()) return true
+        val scheme = i.data?.scheme
+        val webLink = i.action == android.content.Intent.ACTION_VIEW && (scheme == "http" || scheme == "https")
+        val newBrowserWindow = pkg in BROWSERS && (i.action == null ||
+            i.component?.className == "org.chromium.chrome.browser.ChromeTabbedActivity")
+        if (!webLink && !newBrowserWindow) return true
+
+        val uri = i.toUri(android.content.Intent.URI_INTENT_SCHEME)
+        val now = SystemClock.uptimeMillis()
+        val adopt = newBrowserWindow
+        if (uri == lastRoutedUri && now - lastRoutedAt < 1500) return adopt
+        lastRoutedUri = uri; lastRoutedAt = now
+        log("ROUTING pkg=$pkg adopt=$adopt uri=$uri")
+        Thread {
+            try {
+                val safe = uri.replace("'", "")
+                Runtime.getRuntime().exec(arrayOf("sh", "-c",
+                    "am broadcast -a com.gantrping.rover.ROUTE -p com.gantrping.rover " +
+                    "--es pkg '$pkg' --es uri '$safe' --ez newWindow $newBrowserWindow --ez adopt $adopt")).waitFor()
+            } catch (e: Throwable) { log("route broadcast failed: ${e.message}") }
+        }.start()
+        return adopt
     }
 
     private fun log(msg: String) {
