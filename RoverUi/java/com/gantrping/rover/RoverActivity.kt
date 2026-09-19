@@ -37,7 +37,8 @@ class RoverActivity : NativeActivity() {
                 "com.gantrping.rover.ROUTE" -> {
                     val uri = intent.getStringExtra("uri") ?: return
                     val pkg = intent.getStringExtra("pkg") ?: return
-                    RoverBridge.routeIntent(uri, pkg, intent.getBooleanExtra("newWindow", false))
+                    if (intent.getBooleanExtra("adopt", false)) RoverBridge.requestAdopt(pkg)
+                    else RoverBridge.routeIntent(uri, pkg, intent.getBooleanExtra("newWindow", false))
                 }
                 "com.gantrping.rover.KB_TYPE" -> {
                     val txt = intent.getStringExtra("text") ?: ""

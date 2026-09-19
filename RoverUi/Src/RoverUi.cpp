@@ -44,6 +44,7 @@ Authors   :
 #else
 #include <thread>
 #include <chrono>
+#include <cstdarg>
 #endif // defined(ANDROID)
 
 #include <assert.h>
@@ -1266,32 +1267,35 @@ static bool CallGetBarSTMatrix(struct android_app* androidApp, int panelIdx, flo
     return r == JNI_TRUE;
 }
 
-static void CallInjectTap(struct android_app* androidApp, int displayId, int x, int y) {
+// action: 0 = DOWN, 1 = UP, 2 = MOVE
+static void CallInjectTouch(struct android_app* androidApp, int displayId, int action, int x, int y) {
     JavaVM* jvm = androidApp->activity->vm;
     JNIEnv* env = nullptr;
     jvm->AttachCurrentThread(&env, nullptr);
     if (!env) return;
     CacheBridgeClass(androidApp, env);
     if (!g_bridgeCls) return;
-    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "injectTap", "(III)Z");
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "injectTouch", "(IIII)Z");
     if (!m) { env->ExceptionClear(); return; }
-    env->CallStaticBooleanMethod(g_bridgeCls, m, (jint)displayId, (jint)x, (jint)y);
+    env->CallStaticBooleanMethod(g_bridgeCls, m, (jint)displayId, (jint)action, (jint)x, (jint)y);
     if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
 }
 
-static void CallInjectSwipe(struct android_app* androidApp, int displayId, int x1, int y1, int x2, int y2, int durationMs) {
+static void CallStick(struct android_app* androidApp, const char* name, const char* sig, ...) {
     JavaVM* jvm = androidApp->activity->vm;
     JNIEnv* env = nullptr;
     jvm->AttachCurrentThread(&env, nullptr);
     if (!env) return;
     CacheBridgeClass(androidApp, env);
     if (!g_bridgeCls) return;
-    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "injectSwipe", "(IIIIII)Z");
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, name, sig);
     if (!m) { env->ExceptionClear(); return; }
-    env->CallStaticBooleanMethod(g_bridgeCls, m, (jint)displayId, (jint)x1, (jint)y1, (jint)x2, (jint)y2, (jint)durationMs);
+    va_list args;
+    va_start(args, sig);
+    env->CallStaticBooleanMethodV(g_bridgeCls, m, args);
+    va_end(args);
     if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
 }
-
 
 // v0.4.2b: kick off MediaProjection consent dialog once at startup
 static void CallRequestMediaProjection(struct android_app* androidApp) {
@@ -2352,6 +2356,9 @@ int main() {
         static int tapPanelIdx = -1;
         static float tapStartU = 0.f, tapStartV = 0.f;  // UV (0..1, 0=top-left) at tap start
         static long tapStartTimeMs = 0;
+        static int tapDid = -1;                 // display receiving the current finger stream
+        static int tapLastX = 0, tapLastY = 0;  // last pixel sent (DOWN or MOVE)
+        static bool tapDragging = false;        // moved past slop; MOVEs are being sent
         // v0.7.1: keyboard hold-to-repeat (backspace, arrows)
         static int kbHeldHand = 0;      // 0=none, 1=left, 2=right
         static float kbHeldU = 0.f, kbHeldV = 0.f;
@@ -3008,9 +3015,14 @@ int main() {
                             tapStartV = uv_v;
                             tapStartTimeMs = (long)(std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::steady_clock::now().time_since_epoch()).count());
-                            ALOGE("[rover-tap] START pi=%d hand=%d uv=(%.3f,%.3f) px=(%d,%d)",
-                                useHit.panelIdx, hand, uv_u, uv_v,
-                                (int)(uv_u * pRef.width), (int)(uv_v * pRef.height));
+                            int px = (int)(uv_u * pRef.width), py = (int)(uv_v * pRef.height);
+                            if (px < 0) px = 0; if (px >= pRef.width) px = pRef.width - 1;
+                            if (py < 0) py = 0; if (py >= pRef.height) py = pRef.height - 1;
+                            tapLastX = px; tapLastY = py; tapDragging = false;
+                            tapDid = CallPanelIdxToDisplayId(androidApp, useHit.panelIdx);
+                            if (tapDid >= 0) CallInjectTouch(androidApp, tapDid, 0, px, py);
+                            ALOGE("[rover-tap] DOWN pi=%d hand=%d did=%d px=(%d,%d)",
+                                useHit.panelIdx, hand, tapDid, px, py);
                         }
                     } else {
                         // v0.8-1b: if bar hit and panel has actionBar, sub-hit-test for buttons/slider
@@ -3274,90 +3286,114 @@ int main() {
             }
         }
 
-        // v0.5.1: tap release detection — fires tap or long-press based on held duration
+        auto qrotT = [](const XrQuaternionf& q, XrVector3f v) {
+            float x=q.x,y=q.y,z=q.z,w=q.w;
+            float ix =  w*v.x + y*v.z - z*v.y;
+            float iy =  w*v.y + z*v.x - x*v.z;
+            float iz =  w*v.z + x*v.y - y*v.x;
+            float iw = -x*v.x - y*v.y - z*v.z;
+            return XrVector3f{
+                ix*w + iw*-x + iy*-z - iz*-y,
+                iy*w + iw*-y + iz*-x - ix*-z,
+                iz*w + iw*-z + ix*-y - iy*-x
+            };
+        };
+        // Pixel on panel [pi] where [hand]'s ray meets the panel plane (may be outside the panel).
+        auto rayToPanelPx = [&](int pi, int hand, int& outX, int& outY) -> bool {
+            const auto& p = panelMgr.PanelAt(pi);
+            XrPosef pw = panelMgr.ResolveWorldPose(pi, headInLocal);
+            XrPosef ctrl = (hand == 1) ? leftCtrl : rightCtrl;
+            XrVector3f rd = computeRayDir(ctrl.orientation);
+            XrVector3f n = qrotT(pw.orientation, {0, 0, 1});
+            float denom = rd.x*n.x + rd.y*n.y + rd.z*n.z;
+            if (std::fabs(denom) < 1e-4f) return false;
+            float t = ((pw.position.x - ctrl.position.x)*n.x + (pw.position.y - ctrl.position.y)*n.y +
+                       (pw.position.z - ctrl.position.z)*n.z) / denom;
+            if (t <= 0.f) return false;
+            float rx = ctrl.position.x + t*rd.x - pw.position.x;
+            float ry = ctrl.position.y + t*rd.y - pw.position.y;
+            float rz = ctrl.position.z + t*rd.z - pw.position.z;
+            XrVector3f axX = qrotT(pw.orientation, {1, 0, 0});
+            XrVector3f axY = qrotT(pw.orientation, {0, 1, 0});
+            float u = (rx*axX.x + ry*axX.y + rz*axX.z + 0.5f * p.size.width) / p.size.width;
+            float v = 1.0f - (rx*axY.x + ry*axY.y + rz*axY.z + 0.5f * p.size.height) / p.size.height;
+            int x = (int)(u * p.width), y = (int)(v * p.height);
+            if (x < 0) x = 0; if (x >= p.width) x = p.width - 1;
+            if (y < 0) y = 0; if (y >= p.height) y = p.height - 1;
+            outX = x; outY = y;
+            return true;
+        };
+
+        // v1.1: trigger is a finger — DOWN on press (above), MOVE while held, UP on release.
+        // Ray jitter under TOUCH_SLOP_PX is swallowed so taps and long-presses stay put.
         if (tapHand != 0 && tapPanelIdx >= 0) {
+            const int TOUCH_SLOP_PX = 14;
             bool stillHeld = (tapHand == 1) ? leftTrigger : rightTrigger;
-            if (!stillHeld) {
-                const auto& p = panelMgr.PanelAt(tapPanelIdx);
-                int x = (int)(tapStartU * p.width);
-                int y = (int)(tapStartV * p.height);
-                if (x < 0) x = 0; if (x >= p.width) x = p.width - 1;
-                if (y < 0) y = 0; if (y >= p.height) y = p.height - 1;
-                int did = CallPanelIdxToDisplayId(androidApp, tapPanelIdx);
-                long nowMs = (long)(std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count());
-                long held = nowMs - tapStartTimeMs;
-                ALOGE("[rover-tap] FIRE pi=%d did=%d px=(%d,%d) held=%ldms", tapPanelIdx, did, x, y, held);
-                if (did >= 0) {
-                    if (held < 500) {
-                        CallInjectTap(androidApp, did, x, y);      // quick tap
-                    } else {
-                        // long-press: same start & end, hold for `held` ms
-                        CallInjectSwipe(androidApp, did, x, y, x, y, (int)held);
+            if (tapDid < 0 || panelMgr.PanelAt(tapPanelIdx).dead) {
+                tapHand = 0; tapPanelIdx = -1;
+            } else if (stillHeld) {
+                int x, y;
+                if (rayToPanelPx(tapPanelIdx, tapHand, x, y)) {
+                    int dx = x - tapLastX, dy = y - tapLastY;
+                    if (!tapDragging && dx*dx + dy*dy > TOUCH_SLOP_PX*TOUCH_SLOP_PX) tapDragging = true;
+                    if (tapDragging && (dx != 0 || dy != 0)) {
+                        CallInjectTouch(androidApp, tapDid, 2, x, y);
+                        tapLastX = x; tapLastY = y;
                     }
                 }
-                tapHand = 0;
-                tapPanelIdx = -1;
+            } else {
+                CallInjectTouch(androidApp, tapDid, 1, tapLastX, tapLastY);
+                ALOGE("[rover-tap] UP did=%d px=(%d,%d) dragged=%d", tapDid, tapLastX, tapLastY, (int)tapDragging);
+                tapHand = 0; tapPanelIdx = -1; tapDid = -1;
             }
         }
 
-        // v0.5.1: scroll via thumbstick Y — while hovering over OES panel body
+        // v1.1: thumbstick = a synthetic finger dragging the content under the ray. The daemon steps
+        // the finger at a fixed cadence (smooth); we stream velocity and the ray's anchor pixel.
         {
-            static long lastScrollMs = 0;
-            long nowScroll = (long)(std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count());
-            if (nowScroll - lastScrollMs >= 50) {   // fire at ~20Hz
-                const float DEAD = 0.15f;
+            static int stHand = 0, stPanel = -1;
+            static int stAnchorX = 0, stAnchorY = 0;
+            const float DEAD = 0.15f;
+            const float MAX_PX_PER_SEC = 2200.0f;
+            auto curve = [&](float v) {
+                float m = std::fabs(v);
+                if (m < DEAD) return 0.0f;
+                float n = (m - DEAD) / (1.0f - DEAD);
+                return (v < 0 ? -1.0f : 1.0f) * n * n;
+            };
+            auto stick = [&](int hand, float& sx, float& sy) {
+                const XrVector2f& st = (hand == 1) ? leftThumbState.currentState : rightThumbState.currentState;
+                sx = curve(st.x); sy = curve(st.y);
+                return sx != 0.0f || sy != 0.0f;
+            };
+            float sx = 0, sy = 0;
+            if (stHand != 0) {
+                if (panelMgr.PanelAt(stPanel).dead || tapHand == stHand || !stick(stHand, sx, sy)) {
+                    CallStick(androidApp, "stickEnd", "()Z");
+                    stHand = 0; stPanel = -1;
+                } else {
+                    int x, y;
+                    if (rayToPanelPx(stPanel, stHand, x, y)) { stAnchorX = x; stAnchorY = y; }
+                    // stick right = content moves left = finger moves left; stick up = finger moves down
+                    CallStick(androidApp, "stickVelocity", "(FFII)Z",
+                        (jfloat)(-sx * MAX_PX_PER_SEC), (jfloat)(sy * MAX_PX_PER_SEC), (jint)stAnchorX, (jint)stAnchorY);
+                }
+            } else {
                 for (int hand = 1; hand <= 2; hand++) {
+                    if (hand == tapHand || hand == grabbedHand || !stick(hand, sx, sy)) continue;
                     const rover::HitResult& h = (hand == 1) ? leftHit : rightHit;
                     if (h.panelIdx < 0 || h.hitBar || h.cornerIdx >= 0) continue;
                     const auto& p = panelMgr.PanelAt(h.panelIdx);
-                    if (!p.oesSourced) continue;
-                    float sy = (hand == 1) ? leftThumbState.currentState.y : rightThumbState.currentState.y;
-                    if (std::fabs(sy) < DEAD) continue;
-                    // Compute hit UV in pixels via same math as tap
-                    auto qrot4 = [](const XrQuaternionf& q, XrVector3f v) {
-                        float x=q.x,y=q.y,z=q.z,w=q.w;
-                        float ix =  w*v.x + y*v.z - z*v.y;
-                        float iy =  w*v.y + z*v.x - x*v.z;
-                        float iz =  w*v.z + x*v.y - y*v.x;
-                        float iw = -x*v.x - y*v.y - z*v.z;
-                        return XrVector3f{
-                            ix*w + iw*-x + iy*-z - iz*-y,
-                            iy*w + iw*-y + iz*-x - ix*-z,
-                            iz*w + iw*-z + ix*-y - iy*-x
-                        };
-                    };
-                    XrPosef panelWorld = panelMgr.ResolveWorldPose(h.panelIdx, headInLocal);
-                    XrPosef ctrl = (hand == 1) ? leftCtrl : rightCtrl;
-                    XrVector3f rd = computeRayDir(ctrl.orientation);
-                    XrVector3f hp = { ctrl.position.x + h.distance*rd.x, ctrl.position.y + h.distance*rd.y, ctrl.position.z + h.distance*rd.z };
-                    XrVector3f axX = qrot4(panelWorld.orientation, {1,0,0});
-                    XrVector3f axY = qrot4(panelWorld.orientation, {0,1,0});
-                    float rx = hp.x - panelWorld.position.x;
-                    float ry = hp.y - panelWorld.position.y;
-                    float rz = hp.z - panelWorld.position.z;
-                    float u_m = rx*axX.x + ry*axX.y + rz*axX.z;
-                    float v_m = rx*axY.x + ry*axY.y + rz*axY.z;
-                    float uv_u = (u_m + 0.5f * p.size.width)  / p.size.width;
-                    float uv_v = 1.0f - (v_m + 0.5f * p.size.height) / p.size.height;
-                    int cx = (int)(uv_u * p.width);
-                    int cy = (int)(uv_v * p.height);
-                    if (cx < 0) cx = 0; if (cx >= p.width) cx = p.width - 1;
-                    if (cy < 0) cy = 0; if (cy >= p.height) cy = p.height - 1;
-                    // Swipe from (cx, cy - delta) to (cx, cy + delta), sy>0 = up on stick = scroll UP page = touch swipes DOWN (natural)
-                    // Ensure delta always > tap-threshold so Android sees swipe not tap
-                    int delta = (int)(sy * 200.0f);  // v0.8.3 #10: halved for slower feel
-                    int minDelta = 120; if (sy > 0) { if (delta < minDelta) delta = minDelta; } else { if (delta > -minDelta) delta = -minDelta; }
-                    int y1 = cy - delta / 2;
-                    int y2 = cy + delta / 2;
-                    if (y1 < 0) y1 = 0; if (y2 >= p.height) y2 = p.height - 1;
+                    if (!p.oesSourced || p.isKeyboard || p.isDock || p.isLauncher) continue;
+                    int x, y;
+                    if (!rayToPanelPx(h.panelIdx, hand, x, y)) continue;
                     int did = CallPanelIdxToDisplayId(androidApp, h.panelIdx);
-                    if (did >= 0) {
-                        CallInjectSwipe(androidApp, did, cx, y1, cx, y2, 100);
-                    }
-                    lastScrollMs = nowScroll;
-                    break;  // one hand per tick
+                    if (did < 0) continue;
+                    CallStick(androidApp, "stickStart", "(IIIII)Z", (jint)did, (jint)x, (jint)y, (jint)p.width, (jint)p.height);
+                    CallStick(androidApp, "stickVelocity", "(FFII)Z",
+                        (jfloat)(-sx * MAX_PX_PER_SEC), (jfloat)(sy * MAX_PX_PER_SEC), (jint)x, (jint)y);
+                    stHand = hand; stPanel = h.panelIdx; stAnchorX = x; stAnchorY = y;
+                    break;
                 }
             }
         }

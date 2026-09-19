@@ -86,6 +86,12 @@ object InjectorMain {
             ActivityRouter.install()
             Thread {
                 while (true) {
+                    Thread.sleep(8)
+                    synchronized(StickDrag) { StickDrag.tick() }
+                }
+            }.apply { isDaemon = true; priority = Thread.MAX_PRIORITY }.start()
+            Thread {
+                while (true) {
                     Thread.sleep(2000)
                     try { TrustedDisplays.reapDead(::log) } catch (e: Throwable) { log("reap failed: ${e.message}") }
                 }
@@ -119,7 +125,7 @@ object InjectorMain {
     }
 
     private fun handleCommand(line: String, out: java.io.OutputStream) {
-        log("recv: $line")
+        if (!line.startsWith("MOVE") && !line.startsWith("SDRAG_VEL")) log("recv: $line")
         val parts = line.trim().split(" ")
         if (parts.isEmpty()) return
         try {
@@ -149,7 +155,16 @@ object InjectorMain {
                     }
                     sendEvent(did, MotionEvent.ACTION_UP, x2, y2, start)
                 }
+                "SDRAG_START" -> synchronized(StickDrag) {
+                    StickDrag.start(parts[1].toInt(), parts[2].toFloat(), parts[3].toFloat(),
+                        parts[4].toInt(), parts[5].toInt())
+                }
+                "SDRAG_VEL" -> synchronized(StickDrag) {
+                    StickDrag.velocity(parts[1].toFloat(), parts[2].toFloat(), parts[3].toFloat(), parts[4].toFloat())
+                }
+                "SDRAG_END" -> synchronized(StickDrag) { StickDrag.end() }
                 "DOWN" -> {
+                    synchronized(StickDrag) { StickDrag.abort() }  // the trigger finger takes over
                     val did = parts[1].toInt(); val x = parts[2].toFloat(); val y = parts[3].toFloat()
                     downTimeMs = SystemClock.uptimeMillis()
                     sendEvent(did, MotionEvent.ACTION_DOWN, x, y, downTimeMs)
@@ -210,12 +225,88 @@ object InjectorMain {
                     }
                     out.write("$reply\n".toByteArray()); out.flush()
                 }
+                "DETACH" -> {  // DETACH <taskId> <displayId>
+                    val ok = try { TaskDetach.detach(parts[1].toInt(), parts[2].toInt()) } catch (e: Throwable) {
+                        log("DETACH failed: ${(e as? java.lang.reflect.InvocationTargetException)?.targetException ?: e}"); false
+                    }
+                    log("DETACH ${parts[1]} -> $ok")
+                    out.write("${if (ok) "OK" else "ERR"}\n".toByteArray()); out.flush()
+                }
                 "VD_RESIZE" -> TrustedDisplays.resize(parts[1].toInt(), parts[2].toInt(), parts[3].toInt(), parts[4].toInt())
                 "VD_RELEASE" -> TrustedDisplays.release(parts[1].toInt())
                 else -> log("unknown cmd: $line")
             }
         } catch (e: Throwable) {
             log("cmd '$line' err: ${e.message}")
+        }
+    }
+
+    /**
+     * Thumbstick scrolling as one continuous synthetic finger, stepped at a fixed cadence so apps'
+     * touch resampling sees evenly spaced samples. Strokes end with ACTION_CANCEL, which never
+     * flings, so release stops instantly and edge re-grabs need no settle pause.
+     */
+    private object StickDrag {
+        private const val MARGIN = 0.15f  // re-grab this far in from the panel edge
+        private const val SLOP_KICK = 16f
+        private const val TOP_REGRAB = 0.30f  // below Chrome's tablet tab strip + toolbar
+        var active = false
+        private var did = 0; private var w = 0; private var h = 0
+        private var x = 0f; private var y = 0f
+        private var vx = 0f; private var vy = 0f; private var ax = 0f; private var ay = 0f
+        private var downTime = 0L; private var lastTick = 0L
+        private var kicked = false
+
+        private fun down(nx: Float, ny: Float) {
+            x = nx; y = ny; kicked = false
+            downTime = SystemClock.uptimeMillis()
+            sendEvent(did, MotionEvent.ACTION_DOWN, x, y, downTime)
+        }
+
+        fun start(d: Int, sx: Float, sy: Float, width: Int, height: Int) {
+            abort()
+            did = d; w = width; h = height; ax = sx; ay = sy; vx = 0f; vy = 0f
+            lastTick = SystemClock.uptimeMillis()
+            down(sx, sy)
+            active = true
+        }
+
+        fun velocity(nvx: Float, nvy: Float, nax: Float, nay: Float) {
+            vx = nvx; vy = nvy; ax = nax; ay = nay
+        }
+
+        fun end() = abort()
+
+        fun abort() {
+            if (!active) return
+            sendEvent(did, MotionEvent.ACTION_CANCEL, x, y, downTime)
+            active = false
+        }
+
+        fun tick() {
+            if (!active) return
+            val now = SystemClock.uptimeMillis()
+            val dt = (now - lastTick).coerceIn(0L, 50L) / 1000f
+            lastTick = now
+            if (vx == 0f && vy == 0f) return
+            if (!kicked) {  // first step clears touch slop so the stroke reads as a drag
+                val len = kotlin.math.sqrt(vx * vx + vy * vy)
+                x += vx / len * SLOP_KICK; y += vy / len * SLOP_KICK
+                kicked = true
+                sendEvent(did, MotionEvent.ACTION_MOVE, x, y, downTime)
+                return
+            }
+            val mx = MARGIN * w; val my = MARGIN * h
+            val nx = x + vx * dt; val ny = y + vy * dt
+            if (nx < mx / 2 || nx > w - mx / 2 || ny < my / 2 || ny > h - my / 2) {
+                // Out of room: cancel and put the finger down on the far side, under the ray otherwise.
+                sendEvent(did, MotionEvent.ACTION_CANCEL, x, y, downTime)
+                down(when { vx > 0 -> minOf(ax, mx); vx < 0 -> maxOf(ax, w - mx); else -> ax.coerceIn(mx, w - mx) },
+                     when { vy > 0 -> minOf(ay, TOP_REGRAB * h); vy < 0 -> maxOf(ay, h - my); else -> ay.coerceIn(my, h - my) })
+                return
+            }
+            x = nx; y = ny
+            sendEvent(did, MotionEvent.ACTION_MOVE, x, y, downTime)
         }
     }
 
@@ -285,18 +376,21 @@ object InjectorMain {
 
         val uri = i.toUri(android.content.Intent.URI_INTENT_SCHEME)
         val now = SystemClock.uptimeMillis()
-        if (uri == lastRoutedUri && now - lastRoutedAt < 1500) return false
+        // Chrome's own window starts carry a window id in extras we can't see, so they must go
+        // through untouched; rover then adopts the task. Everything else is vetoed and re-issued.
+        val adopt = newBrowserWindow
+        if (uri == lastRoutedUri && now - lastRoutedAt < 1500) return adopt
         lastRoutedUri = uri; lastRoutedAt = now
-        log("ROUTING pkg=$pkg newWindow=$newBrowserWindow uri=$uri")
+        log("ROUTING pkg=$pkg adopt=$adopt uri=$uri")
         Thread {
             try {
                 val safe = uri.replace("'", "")
                 Runtime.getRuntime().exec(arrayOf("sh", "-c",
                     "am broadcast -a com.gantrping.rover.ROUTE -p com.gantrping.rover " +
-                    "--es pkg '$pkg' --es uri '$safe' --ez newWindow $newBrowserWindow")).waitFor()
+                    "--es pkg '$pkg' --es uri '$safe' --ez newWindow $newBrowserWindow --ez adopt $adopt")).waitFor()
             } catch (e: Throwable) { log("route broadcast failed: ${e.message}") }
         }.start()
-        return false
+        return adopt
     }
 
     private fun log(msg: String) {

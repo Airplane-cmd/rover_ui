@@ -65,6 +65,15 @@ object RoverBridge {
     @Volatile private var pendingSpawnUrl: String = ""
     @Volatile private var pendingSpawnIntent: android.content.Intent? = null
     @Volatile private var pendingSpawnMultiTask = false
+    @Volatile private var pendingAdoptPkg: String? = null
+
+    /** An app opened a window on its own (Chrome "new window"): give it a panel and pull it in. */
+    @JvmStatic fun requestAdopt(pkg: String) {
+        Log.i(TAG, "requestAdopt $pkg")
+        pendingAdoptPkg = pkg
+        requestSpawn(pkg, "")
+    }
+
 
     /** Move the newest [pkg] task living outside rover's panels onto [displayId]. */
     private data class TaskLoc(val taskId: Int, val rootId: Int, val displayId: Int)
@@ -107,6 +116,15 @@ object RoverBridge {
             if (stray != null) {
                 Log.i(TAG, "adopt: moving task ${stray.taskId} (root ${stray.rootId}, display ${stray.displayId}) to $displayId")
                 Runtime.getRuntime().exec(arrayOf("su", "-c", "am display move-stack ${stray.rootId} $displayId")).waitFor()
+                if (stray.rootId != stray.taskId) {
+                    // Meta wrapped the task in a volumetric-window container. Detach the task so the
+                    // emptied container (and vrshell's ghost panel for it) goes away, then re-front
+                    // rover so vrshell drops the overlay the brief shell appearance woke up.
+                    val r = injectorRequest("DETACH ${stray.taskId} $displayId")
+                    Log.i(TAG, "adopt: detach ${stray.taskId} -> $r")
+                    Runtime.getRuntime().exec(arrayOf("su", "-c",
+                        "am start -n ${activity?.packageName}/.RoverActivity")).waitFor()
+                }
                 return
             }
             Thread.sleep(100)
@@ -117,10 +135,14 @@ object RoverBridge {
         }
     }
 
+    @Volatile private var routingOn = false
+    private fun routeCmd() = "ROUTE ${if (routingOn) 1 else 0} ${android.os.Process.myPid()}"
+
     @JvmStatic fun setRouting(on: Boolean) {
+        routingOn = on
         Thread {
             ensureInjectorRunning()
-            sendInject("ROUTE ${if (on) 1 else 0} ${android.os.Process.myPid()}")
+            sendInject(routeCmd())
         }.start()
     }
 
@@ -209,6 +231,7 @@ object RoverBridge {
         // Take pending launch state now, before a later spawn request can overwrite it.
         val url = pendingSpawnUrl.also { pendingSpawnUrl = "" }
         val intent = pendingSpawnIntent.also { pendingSpawnIntent = null }
+        val adopt = pendingAdoptPkg.also { pendingAdoptPkg = null }
         val multi = pendingSpawnMultiTask
         a.runOnUiThread {
             val st: android.graphics.SurfaceTexture
@@ -235,6 +258,7 @@ object RoverBridge {
                     hostedApps.add(HostedApp(panelIdx, vdid, vd, surf, st, oesTexId, pkg, act))
                     setDisplayImePolicy(vdid, 0)
                     when {
+                        adopt != null -> { launchedPackages.add(pkg); adoptTask(adopt, vdid, panelIdx, null, 30) }
                         intent != null -> launchIntentOnDisplay(intent, pkg, vdid, multi)
                         url.isNotBlank() -> launchAppOnDisplayWithUrl(pkg, act, vdid, url)
                         else -> launchAppOnDisplay(pkg, act, vdid)
@@ -913,6 +937,27 @@ object RoverBridge {
     fun setDisplayImePolicy(displayId: Int, policy: Int): Boolean =
         sendInject("IME_POLICY $displayId $policy")
 
+    /** action: 0 = DOWN, 1 = UP, 2 = MOVE */
+    @JvmStatic
+    fun injectTouch(displayId: Int, action: Int, x: Int, y: Int): Boolean {
+        val verb = when (action) {
+            0 -> {
+                lastTappedOesDisplayId = displayId
+                sendInject("IME_POLICY $displayId 0")  // Meta shell keeps resetting it
+                "DOWN"
+            }
+            2 -> "MOVE"
+            else -> "UP"
+        }
+        return sendInject("$verb $displayId $x $y")
+    }
+
+    @JvmStatic fun stickStart(displayId: Int, x: Int, y: Int, w: Int, h: Int): Boolean =
+        sendInject("SDRAG_START $displayId $x $y $w $h")
+    @JvmStatic fun stickVelocity(vx: Float, vy: Float, ax: Int, ay: Int): Boolean =
+        sendInject("SDRAG_VEL $vx $vy $ax $ay")
+    @JvmStatic fun stickEnd(): Boolean = sendInject("SDRAG_END")
+
     @JvmStatic
     fun injectTap(displayId: Int, x: Int, y: Int): Boolean {
         lastTappedOesDisplayId = displayId
@@ -950,7 +995,13 @@ object RoverBridge {
                 }
                 Log.i(TAG, "injector runs stale apk ${who[0]}; replacing pid ${who[1]}")
                 try { Runtime.getRuntime().exec(arrayOf("su", "-c", "kill ${who[1]}")).waitFor() } catch (_: Throwable) {}
-                Thread.sleep(300)
+                val gone = System.currentTimeMillis() + 3000
+                while (System.currentTimeMillis() < gone) {
+                    try {
+                        LocalSocket().use { it.connect(LocalSocketAddress(INJECTOR_SOCKET, LocalSocketAddress.Namespace.ABSTRACT)) }
+                        Thread.sleep(50)
+                    } catch (_: Throwable) { break }
+                }
             }
             val spawn = "CLASSPATH=$apkPath /system/bin/app_process /system/bin " +
                         "com.gantrping.rover.InjectorMain >/data/local/tmp/rover_inject.log 2>&1 &"
@@ -976,23 +1027,35 @@ object RoverBridge {
         }
     }
 
+    private var injectSock: LocalSocket? = null  // touched only on execExecutor
+
     private fun sendInject(cmd: String): Boolean {
-        Log.i(TAG, "sendInject: $cmd")
+        if (!cmd.startsWith("MOVE") && !cmd.startsWith("SDRAG_VEL")) Log.i(TAG, "sendInject: $cmd")
         if (!injectorSpawned) {
             // Kick off spawn on bg thread; drop this event, next will land
             Thread { ensureInjectorRunning() }.start()
             return false
         }
         execExecutor.submit {
-            try {
-                val s = LocalSocket()
-                s.connect(LocalSocketAddress(INJECTOR_SOCKET, LocalSocketAddress.Namespace.ABSTRACT))
-                s.outputStream.write("$cmd\n".toByteArray())
-                s.outputStream.flush()
-                s.close()
-            } catch (e: Throwable) {
-                Log.e(TAG, "sendInject async failed: $cmd", e)
-                injectorSpawned = false
+            val line = "$cmd\n".toByteArray()
+            for (attempt in 0..1) {
+                try {
+                    val s = injectSock ?: LocalSocket().also {
+                        it.connect(LocalSocketAddress(INJECTOR_SOCKET, LocalSocketAddress.Namespace.ABSTRACT))
+                        it.outputStream.write("${routeCmd()}\n".toByteArray())
+                        injectSock = it
+                    }
+                    s.outputStream.write(line)
+                    s.outputStream.flush()
+                    return@submit
+                } catch (e: Throwable) {
+                    try { injectSock?.close() } catch (_: Throwable) {}
+                    injectSock = null
+                    if (attempt == 1) {
+                        Log.e(TAG, "sendInject failed: $cmd", e)
+                        injectorSpawned = false
+                    }
+                }
             }
         }
         return true
