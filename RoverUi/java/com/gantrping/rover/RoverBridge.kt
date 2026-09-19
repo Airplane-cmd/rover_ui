@@ -491,6 +491,7 @@ object RoverBridge {
     @Volatile private var vdCreatePending: Boolean = false
     private val stMatrix = FloatArray(16)
 
+    @JvmStatic fun isActive(): Boolean = activity != null
     @JvmStatic fun setActivity(a: Activity?) { activity = a; Log.i(TAG, "setActivity: $a") }
     @JvmStatic fun helloFromKotlin(): String = "hello from Kotlin! v0.4.3a activity=${activity != null}"
     @JvmStatic fun setExternalOesTextureId(id: Int) { externalOesTexId = id; Log.i(TAG, "setExternalOesTextureId($id)") }

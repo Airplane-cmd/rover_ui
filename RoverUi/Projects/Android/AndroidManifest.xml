@@ -63,6 +63,17 @@
         android:foregroundServiceType="mediaProjection"
         android:exported="false" />
     <service
+        android:name="com.gantrping.rover.RoverInputFilterService"
+        android:exported="false"
+        android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+      <intent-filter>
+        <action android:name="android.accessibilityservice.AccessibilityService" />
+      </intent-filter>
+      <meta-data
+          android:name="android.accessibilityservice"
+          android:resource="@xml/rover_input_filter" />
+    </service>
+    <service
         android:name="com.gantrping.rover.RoverImeService"
         android:exported="true"
         android:permission="android.permission.BIND_INPUT_METHOD">

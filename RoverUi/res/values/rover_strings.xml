@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="rover_input_filter_desc">Rover: blocks controller gamepad keys from reaching hosted apps</string>
+</resources>

@@ -74,6 +74,15 @@ class RoverActivity : NativeActivity() {
                 Log.i("RoverBridge", "IME auto-set + Meta IME disabled")
             } catch (e: Throwable) { Log.e("RoverBridge", "IME auto-set failed", e) }
         }.start()
+        Thread {
+            try {
+                Runtime.getRuntime().exec(arrayOf("su", "-c",
+                    "v=$(settings get secure enabled_accessibility_services | tr ':' '\\n' | grep -v '^com.gantrping.rover/' | grep -v '^null$' | tr '\\n' ':' | sed 's/:$//'); " +
+                    "settings put secure enabled_accessibility_services \"${'$'}{v:+${'$'}v:}com.gantrping.rover/com.gantrping.rover.RoverInputFilterService\"; " +
+                    "settings put secure accessibility_enabled 1")).waitFor()
+                Log.i("RoverBridge", "input filter a11y service enabled")
+            } catch (e: Throwable) { Log.e("RoverBridge", "a11y enable failed", e) }
+        }.start()
         Thread { RoverBridge.ensureInjectorRunning() }.start()
         val filter = IntentFilter().apply {
             addAction(RoverBridge.ACTION_CFG)
@@ -101,7 +110,10 @@ class RoverActivity : NativeActivity() {
                 Runtime.getRuntime().exec(arrayOf("su", "-c",
                     "cmd input_method ime enable com.oculus.vrshell/com.oculus.panelapp.keyboardv2.KeyboardInputMethodService; " +
                     "cmd input_method ime enable com.google.android.inputmethod.latin/com.android.inputmethod.latin.LatinIME; " +
-                    "cmd input_method ime enable helium314.keyboard/.latin.LatinIME")).waitFor()
+                    "cmd input_method ime enable helium314.keyboard/.latin.LatinIME; " +
+                    "v=$(settings get secure enabled_accessibility_services | tr ':' '\\n' | grep -v '^com.gantrping.rover/' | grep -v '^null$' | tr '\\n' ':' | sed 's/:$//'); " +
+                    "if [ -n \"${'$'}v\" ]; then settings put secure enabled_accessibility_services \"${'$'}v\"; " +
+                    "else settings delete secure enabled_accessibility_services; settings put secure accessibility_enabled 0; fi")).waitFor()
             } catch (_: Throwable) {}
         }.start()
         super.onDestroy()
