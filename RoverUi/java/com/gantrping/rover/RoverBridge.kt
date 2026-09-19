@@ -42,7 +42,7 @@ object RoverBridge {
     data class HostedApp(
         val panelIdx: Int,
         val vdId: Int,
-        val vd: android.hardware.display.VirtualDisplay,
+        val vd: android.hardware.display.VirtualDisplay?,  // null = trusted display owned by the daemon
         val surface: Surface,
         val st: android.graphics.SurfaceTexture,
         val oesTexId: Int,
@@ -51,6 +51,8 @@ object RoverBridge {
     )
     @JvmStatic private val hostedApps = java.util.concurrent.CopyOnWriteArrayList<HostedApp>()
     private const val VIRTUAL_DISPLAY_FLAG_DESTROY_CONTENT_ON_REMOVAL = 1 shl 8
+    private const val CHROME = "com.android.chrome"
+    private const val CHROME_TABBED = "org.chromium.chrome.browser.ChromeTabbedActivity"
 
     /** True if a panel other than [displayId] hosts [pkg]; force-stopping would kill it. */
     private fun pkgHostedElsewhere(pkg: String, displayId: Int) =
@@ -63,14 +65,6 @@ object RoverBridge {
     @Volatile private var pendingSpawnUrl: String = ""
     @Volatile private var pendingSpawnIntent: android.content.Intent? = null
     @Volatile private var pendingSpawnMultiTask = false
-    @Volatile private var pendingAdoptPkg: String? = null
-
-    /** An app opened a window on its own (e.g. Chrome "move to new window"): give it a panel. */
-    @JvmStatic fun requestAdopt(pkg: String) {
-        Log.i(TAG, "requestAdopt $pkg")
-        pendingAdoptPkg = pkg
-        requestSpawn(pkg, "")
-    }
 
     /** Move the newest [pkg] task living outside rover's panels onto [displayId]. */
     private data class TaskLoc(val taskId: Int, val rootId: Int, val displayId: Int)
@@ -101,8 +95,14 @@ object RoverBridge {
     private fun adoptTask(pkg: String, displayId: Int, panelIdx: Int, before: Set<Int>?, tries: Int) {
         repeat(tries) {
             val ours = hostedApps.map { it.vdId }.toSet()
-            val stray = listPkgTasks(pkg)
-                .filter { it.displayId !in ours && (before == null || it.taskId !in before) }
+            val tasks = listPkgTasks(pkg)
+            // On trusted panels an app's new window lands on its own panel as an extra task;
+            // the oldest task on each panel is that panel's own window.
+            val panelOwners = tasks.filter { it.displayId in ours }
+                .groupBy { it.displayId }.mapValues { (_, t) -> t.minOf { it.taskId } }
+            val stray = tasks
+                .filter { it.displayId != displayId && (before == null || it.taskId !in before) }
+                .filter { it.displayId !in ours || it.taskId != panelOwners[it.displayId] }
                 .maxByOrNull { it.taskId }
             if (stray != null) {
                 Log.i(TAG, "adopt: moving task ${stray.taskId} (root ${stray.rootId}, display ${stray.displayId}) to $displayId")
@@ -129,9 +129,11 @@ object RoverBridge {
         val parsed = try { android.content.Intent.parseUri(uri, android.content.Intent.URI_INTENT_SCHEME) }
                 catch (e: Throwable) { Log.e(TAG, "routeIntent: bad uri $uri", e); return }
         // Meta's browser is the system fallback for web links; route those to Chrome instead.
-        val toChrome = origPkg == "com.oculus.browser"
-        val pkg = if (toChrome) "com.android.chrome" else origPkg
-        val i = if (toChrome) parsed.apply { component = null; setPackage(pkg) } else parsed
+        val pkg = if (origPkg == "com.oculus.browser") CHROME else origPkg
+        val i = parsed
+        // Target ChromeTabbedActivity directly: Chrome's IntentDispatcher re-launches it without a
+        // display, and Meta wraps any such start in a vrshell volumetric window.
+        if (pkg == CHROME) i.component = android.content.ComponentName(CHROME, CHROME_TABBED)
         val existing = hostedApps.lastOrNull { it.pkg == pkg }
         Log.i(TAG, "routeIntent pkg=$pkg newWindow=$newWindow existing=${existing?.vdId} uri=$uri")
         if (!newWindow && existing != null) {
@@ -149,7 +151,7 @@ object RoverBridge {
         sendInject("EXEMPT $pkg")
         launchedPackages.add(pkg)
         val cmd = StringBuilder("am start --display $displayId -f ")
-            .append(if (multiTask) "0x18001000" else "0x10000000")
+            .append(if (multiTask) "0x18000000" else "0x10000000")
         i.action?.let { cmd.append(" -a $it") }
         i.dataString?.let { cmd.append(" -d '").append(it.replace("'", "")).append("'") }
         i.categories?.forEach { cmd.append(" -c $it") }
@@ -204,41 +206,69 @@ object RoverBridge {
         val parts = pkgActivity.split("|", limit = 2)
         if (parts.size != 2) { Log.w(TAG, "bad pkgActivity: $pkgActivity"); return }
         val (pkg, act) = parts
+        // Take pending launch state now, before a later spawn request can overwrite it.
+        val url = pendingSpawnUrl.also { pendingSpawnUrl = "" }
+        val intent = pendingSpawnIntent.also { pendingSpawnIntent = null }
+        val multi = pendingSpawnMultiTask
         a.runOnUiThread {
+            val st: android.graphics.SurfaceTexture
+            val surf: Surface
             try {
-                val st = android.graphics.SurfaceTexture(oesTexId).also {
-                    it.setDefaultBufferSize(w, h)
+                st = android.graphics.SurfaceTexture(oesTexId).also { it.setDefaultBufferSize(w, h) }
+                surf = Surface(st)
+            } catch (e: Throwable) { Log.e(TAG, "onPanelSpawnedNative failed", e); return@runOnUiThread }
+            Thread {
+                try {
+                    var vd: android.hardware.display.VirtualDisplay? = null
+                    var vdid = createTrustedDisplay(panelIdx, surf, w, h)
+                    if (vdid < 0) {
+                        Log.w(TAG, "trusted display failed; falling back to an untrusted VD")
+                        val dm = a.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+                        val flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
+                                    DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION or
+                                    DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY or
+                                    VIRTUAL_DISPLAY_FLAG_DESTROY_CONTENT_ON_REMOVAL
+                        vd = dm.createVirtualDisplay("rover-panel-$panelIdx", w, h, VD_DPI, surf, flags)
+                        vdid = vd.display?.displayId ?: -1
+                    }
+                    Log.i(TAG, "spawned panel=$panelIdx vd=$vdid trusted=${vd == null} tex=$oesTexId for $pkg")
+                    hostedApps.add(HostedApp(panelIdx, vdid, vd, surf, st, oesTexId, pkg, act))
+                    setDisplayImePolicy(vdid, 0)
+                    when {
+                        intent != null -> launchIntentOnDisplay(intent, pkg, vdid, multi)
+                        url.isNotBlank() -> launchAppOnDisplayWithUrl(pkg, act, vdid, url)
+                        else -> launchAppOnDisplay(pkg, act, vdid)
+                    }
+                } catch (e: Throwable) {
+                    Log.e(TAG, "onPanelSpawnedNative bg failed", e)
                 }
-                val surf = Surface(st)
-                val dm = a.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
-                val flags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
-                            DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION or
-                            DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY or
-                            VIRTUAL_DISPLAY_FLAG_DESTROY_CONTENT_ON_REMOVAL
-                val vd = dm.createVirtualDisplay("rover-panel-$panelIdx", w, h, VD_DPI, surf, flags)
-                val vdid = vd.display?.displayId ?: -1
-                Log.i(TAG, "spawned panel=$panelIdx vd=$vdid tex=$oesTexId for $pkg")
-                hostedApps.add(HostedApp(panelIdx, vdid, vd, surf, st, oesTexId, pkg, act))
-                Thread { ensureInjectorRunning(); setDisplayImePolicy(vdid, 0) }.start()
-                val urlForThis = pendingSpawnUrl.also { pendingSpawnUrl = "" }
-                val intentForThis = pendingSpawnIntent.also { pendingSpawnIntent = null }
-                val adoptForThis = pendingAdoptPkg.also { pendingAdoptPkg = null }
-                if (adoptForThis != null) {
-                    launchedPackages.add(pkg)
-                    Thread { adoptTask(adoptForThis, vdid, panelIdx, null, 30) }.start()
-                } else if (intentForThis != null) {
-                    val multi = pendingSpawnMultiTask
-                    Thread { launchIntentOnDisplay(intentForThis, pkg, vdid, multi) }.start()
-                } else if (urlForThis.isNotBlank()) {
-                    launchAppOnDisplayWithUrl(pkg, act, vdid, urlForThis)
-                } else {
-                    launchAppOnDisplay(pkg, act, vdid)
-                }
-            } catch (e: Throwable) {
-                Log.e(TAG, "onPanelSpawnedNative failed", e)
-            }
+            }.start()
         }
     }
+
+    /** Ask the root daemon for a trusted display on [surf]. Returns display id or -1. */
+    private fun createTrustedDisplay(panelIdx: Int, surf: Surface, w: Int, h: Int): Int {
+        if (!ensureInjectorRunning()) return -1
+        val key = "panel-$panelIdx-${System.nanoTime()}"
+        RoverSurfaceProvider.surfaces[key] = surf
+        try {
+            val reply = injectorRequest(
+                "VD_CREATE $key $w $h $VD_DPI ${android.os.Process.myPid()} rover-panel-$panelIdx") ?: return -1
+            return if (reply.startsWith("OK ")) reply.substring(3).trim().toInt() else -1
+        } finally {
+            RoverSurfaceProvider.surfaces.remove(key)
+        }
+    }
+
+    /** Synchronous request/reply over the daemon socket. Call off the UI thread. */
+    private fun injectorRequest(cmd: String): String? = try {
+        LocalSocket().use { s ->
+            s.connect(LocalSocketAddress(INJECTOR_SOCKET, LocalSocketAddress.Namespace.ABSTRACT))
+            s.soTimeout = 5000
+            s.outputStream.write("$cmd\n".toByteArray()); s.outputStream.flush()
+            BufferedReader(InputStreamReader(s.inputStream)).readLine()
+        }
+    } catch (e: Throwable) { Log.e(TAG, "injectorRequest '$cmd' failed", e); null }
 
     /** Iterate all hosted-app SurfaceTextures and updateTexImage. Called from GL thread. */
     @JvmStatic
@@ -263,7 +293,7 @@ object RoverBridge {
             if (!pkgHostedElsewhere(app.pkg, app.vdId)) {
                 try { Runtime.getRuntime().exec(arrayOf("su", "-c", "am force-stop ${app.pkg}")) } catch (_: Throwable) {}
             }
-            try { app.vd.release() } catch (_: Throwable) {}
+            try { app.vd?.release() ?: sendInject("VD_RELEASE ${app.vdId}") } catch (_: Throwable) {}
             try { app.surface.release() } catch (_: Throwable) {}
             try { app.st.release() } catch (_: Throwable) {}
             bar?.let {
@@ -444,8 +474,8 @@ object RoverBridge {
         val a = activity ?: return
         a.runOnUiThread {
             try {
-                app.vd.resize(width, height, dpi)
                 app.st.setDefaultBufferSize(width, height)
+                app.vd?.resize(width, height, dpi) ?: sendInject("VD_RESIZE ${app.vdId} $width $height $dpi")
                 Log.i(TAG, "resizeHostedApp panel=$panelIdx -> ${width}x$height @${dpi}dpi")
             } catch (e: Throwable) {
                 Log.e(TAG, "resizeHostedApp failed", e)
@@ -911,14 +941,17 @@ object RoverBridge {
                 ctx.packageManager.getApplicationInfo(ctx.packageName, 0).sourceDir
             } catch (e: Throwable) { Log.e(TAG, "apkPath lookup failed", e); return false }
             // Check if socket already alive (daemon spawned by prior instance still up)
-            try {
-                LocalSocket().use { s ->
-                    s.connect(LocalSocketAddress(INJECTOR_SOCKET, LocalSocketAddress.Namespace.ABSTRACT))
+            val who = injectorRequest("WHOAMI")?.trim()?.split(" ")
+            if (who != null && who.size == 2) {
+                if (who[0] == apkPath) {
                     injectorSpawned = true
                     Log.i(TAG, "injector already alive, reusing")
                     return true
                 }
-            } catch (_: Throwable) { }
+                Log.i(TAG, "injector runs stale apk ${who[0]}; replacing pid ${who[1]}")
+                try { Runtime.getRuntime().exec(arrayOf("su", "-c", "kill ${who[1]}")).waitFor() } catch (_: Throwable) {}
+                Thread.sleep(300)
+            }
             val spawn = "CLASSPATH=$apkPath /system/bin/app_process /system/bin " +
                         "com.gantrping.rover.InjectorMain >/data/local/tmp/rover_inject.log 2>&1 &"
             Log.i(TAG, "spawning injector: $spawn")

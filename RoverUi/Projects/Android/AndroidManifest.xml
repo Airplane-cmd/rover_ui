@@ -62,6 +62,10 @@
         android:name="com.gantrping.rover.MediaProjectionService"
         android:foregroundServiceType="mediaProjection"
         android:exported="false" />
+    <provider
+        android:name="com.gantrping.rover.RoverSurfaceProvider"
+        android:authorities="com.gantrping.rover.surfaces"
+        android:exported="true" />
     <service
         android:name="com.gantrping.rover.RoverInputFilterService"
         android:exported="false"

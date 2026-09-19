@@ -84,6 +84,12 @@ object InjectorMain {
             }
             ActivityRouter.onStarting = ::routeStart
             ActivityRouter.install()
+            Thread {
+                while (true) {
+                    Thread.sleep(2000)
+                    try { TrustedDisplays.reapDead(::log) } catch (e: Throwable) { log("reap failed: ${e.message}") }
+                }
+            }.apply { isDaemon = true }.start()
             log("started; im=${im.javaClass.name}")
 
             val server = LocalServerSocket(SOCKET_NAME)
@@ -188,6 +194,24 @@ object InjectorMain {
                 }
                 "EXEMPT" -> exemptUntil[parts[1]] = SystemClock.uptimeMillis() + 3000
                 "PING" -> { out.write("PONG\n".toByteArray()); out.flush() }
+                "WHOAMI" -> {
+                    val cp = System.getProperty("java.class.path") ?: ""
+                    out.write("$cp ${android.os.Process.myPid()}\n".toByteArray()); out.flush()
+                }
+                "VD_CREATE" -> {  // VD_CREATE <key> <w> <h> <dpi> <ownerPid> <name>
+                    val reply = try {
+                        val id = TrustedDisplays.create(parts[1], parts[2].toInt(), parts[3].toInt(),
+                            parts[4].toInt(), parts[5].toInt(), parts[6])
+                        log("VD_CREATE ${parts[6]} -> display $id")
+                        "OK $id"
+                    } catch (e: Throwable) {
+                        val c = (e as? java.lang.reflect.InvocationTargetException)?.targetException ?: e
+                        log("VD_CREATE failed: $c"); "ERR"
+                    }
+                    out.write("$reply\n".toByteArray()); out.flush()
+                }
+                "VD_RESIZE" -> TrustedDisplays.resize(parts[1].toInt(), parts[2].toInt(), parts[3].toInt(), parts[4].toInt())
+                "VD_RELEASE" -> TrustedDisplays.release(parts[1].toInt())
                 else -> log("unknown cmd: $line")
             }
         } catch (e: Throwable) {
@@ -261,19 +285,18 @@ object InjectorMain {
 
         val uri = i.toUri(android.content.Intent.URI_INTENT_SCHEME)
         val now = SystemClock.uptimeMillis()
-        val adopt = newBrowserWindow
-        if (uri == lastRoutedUri && now - lastRoutedAt < 1500) return adopt
+        if (uri == lastRoutedUri && now - lastRoutedAt < 1500) return false
         lastRoutedUri = uri; lastRoutedAt = now
-        log("ROUTING pkg=$pkg adopt=$adopt uri=$uri")
+        log("ROUTING pkg=$pkg newWindow=$newBrowserWindow uri=$uri")
         Thread {
             try {
                 val safe = uri.replace("'", "")
                 Runtime.getRuntime().exec(arrayOf("sh", "-c",
                     "am broadcast -a com.gantrping.rover.ROUTE -p com.gantrping.rover " +
-                    "--es pkg '$pkg' --es uri '$safe' --ez newWindow $newBrowserWindow --ez adopt $adopt")).waitFor()
+                    "--es pkg '$pkg' --es uri '$safe' --ez newWindow $newBrowserWindow")).waitFor()
             } catch (e: Throwable) { log("route broadcast failed: ${e.message}") }
         }.start()
-        return adopt
+        return false
     }
 
     private fun log(msg: String) {
