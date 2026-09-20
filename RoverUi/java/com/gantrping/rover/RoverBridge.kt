@@ -231,6 +231,7 @@ object RoverBridge {
         // Take pending launch state now, before a later spawn request can overwrite it.
         val url = pendingSpawnUrl.also { pendingSpawnUrl = "" }
         val intent = pendingSpawnIntent.also { pendingSpawnIntent = null }
+        val notifPi = pendingSpawnPendingIntent.also { pendingSpawnPendingIntent = null }
         val adopt = pendingAdoptPkg.also { pendingAdoptPkg = null }
         val multi = pendingSpawnMultiTask
         a.runOnUiThread {
@@ -258,6 +259,7 @@ object RoverBridge {
                     hostedApps.add(HostedApp(panelIdx, vdid, vd, surf, st, oesTexId, pkg, act))
                     setDisplayImePolicy(vdid, 0)
                     when {
+                        notifPi != null -> sendPendingIntentOnDisplay(notifPi, pkg, vdid)
                         adopt != null -> { launchedPackages.add(pkg); adoptTask(adopt, vdid, panelIdx, null, 30) }
                         intent != null -> launchIntentOnDisplay(intent, pkg, vdid, multi)
                         url.isNotBlank() -> launchAppOnDisplayWithUrl(pkg, act, vdid, url)
@@ -285,7 +287,7 @@ object RoverBridge {
     }
 
     /** Synchronous request/reply over the daemon socket. Call off the UI thread. */
-    private fun injectorRequest(cmd: String): String? = try {
+    internal fun injectorRequest(cmd: String): String? = try {
         LocalSocket().use { s ->
             s.connect(LocalSocketAddress(INJECTOR_SOCKET, LocalSocketAddress.Namespace.ABSTRACT))
             s.soTimeout = 5000
@@ -390,7 +392,7 @@ object RoverBridge {
             canvas.drawColor(0, android.graphics.PorterDuff.Mode.CLEAR)
             val bmp = android.graphics.Bitmap.createBitmap(DockTexture.W, DockTexture.H,
                 android.graphics.Bitmap.Config.ARGB_8888)
-            val pixels = DockTexture.render(timeStr, battStr)
+            val pixels = DockTexture.render(timeStr, battStr, RoverNotificationService.current().size, dockPinned, shadeMode, recording)
             bmp.copyPixelsFromBuffer(pixels)
             canvas.drawBitmap(bmp, 0f, 0f, null)
             bmp.recycle()
@@ -409,11 +411,483 @@ object RoverBridge {
         val act = DockTexture.hitAction(u)
         Log.i(TAG, "dock hit u=$u act=$act")
         when (act) {
-            1 -> toggleLauncherVisible()  // v0.9.2: opens app launcher grid
-            2 -> requestKbVisible(true)
-            3 -> { for (app in hostedApps.toList()) requestClose(app.panelIdx) }
-            4 -> Log.i(TAG, "dock status/settings tap (quick settings TBD)")
+            DockTexture.ACT_APPS -> toggleLauncherVisible()
+            DockTexture.ACT_KEYBOARD -> requestKbVisible(true)
+            DockTexture.ACT_CLOSE_ALL -> { for (app in hostedApps.toList()) requestClose(app.panelIdx) }
+            DockTexture.ACT_NOTIFICATIONS -> toggleShade(ShadeTexture.MODE_NOTIFICATIONS)
+            DockTexture.ACT_QUICK_SETTINGS -> toggleShade(ShadeTexture.MODE_QUICK_SETTINGS)
+            DockTexture.ACT_RECORD -> toggleRecording()
+            DockTexture.ACT_PIN -> {
+                dockPinned = !dockPinned
+                dockPinReq = if (dockPinned) 1 else 0
+                hideToast()
+            }
+            else -> return
         }
+        activity?.runOnUiThread { renderDockToSurface() }
+    }
+
+    // ============ dock shade: quick settings + notifications ============
+    @Volatile @JvmStatic var shadePanelIdx: Int = -1
+    @Volatile private var shadeSurfaceTexture: android.graphics.SurfaceTexture? = null
+    @Volatile private var shadeSurface: Surface? = null
+    @Volatile private var shadeMode = 0          // 0 closed, ShadeTexture.MODE_*
+    @Volatile private var shadeVisReq = -1       // polled by native: -1 none, 0 hide, 1 show
+    @Volatile private var dockPinned = false     // head-locked at the top of view vs body-locked below
+    @Volatile private var dockPinReq = -1        // polled by native: -1 none, 0 unpin, 1 pin
+    private val shadeExec = java.util.concurrent.Executors.newSingleThreadExecutor()
+
+    @JvmStatic
+    fun setShadeOesTextureId(panelIdx: Int, id: Int) {
+        shadePanelIdx = panelIdx
+        val st = android.graphics.SurfaceTexture(id).apply { setDefaultBufferSize(ShadeTexture.W, ShadeTexture.H) }
+        shadeSurfaceTexture = st
+        shadeSurface = Surface(st)
+    }
+
+    @JvmStatic
+    fun updateShadeSurfaceTexImage(): Boolean {
+        val st = shadeSurfaceTexture ?: return false
+        return try { st.updateTexImage(); true } catch (_: Throwable) { false }
+    }
+
+    @JvmStatic fun pollShadeVisRequest(): Int { val r = shadeVisReq; shadeVisReq = -1; return r }
+    @JvmStatic fun pollDockPinRequest(): Int { val r = dockPinReq; dockPinReq = -1; return r }
+
+    private fun toggleShade(mode: Int) {
+        endWifiJoin()
+        endReply()
+        if (shadeMode == mode) {
+            shadeMode = 0
+            shadeVisReq = 0
+            return
+        }
+        hideToast()
+        shadeMode = mode
+        ShadeTexture.resetScroll()
+        renderShade(refreshQuickSettings = mode == ShadeTexture.MODE_QUICK_SETTINGS)
+        shadeVisReq = 1
+    }
+
+    private fun renderShade(refreshQuickSettings: Boolean = false) {
+        val a = activity ?: return
+        shadeExec.submit {
+            shadeRenderQueued = false
+            if (refreshQuickSettings) QuickSettings.refresh(a)
+            val surf = shadeSurface ?: return@submit
+            val mode = shadeMode
+            if (mode == 0) return@submit
+            var canvas: android.graphics.Canvas? = null
+            try {
+                canvas = surf.lockCanvas(null)
+                ShadeTexture.draw(canvas, a, mode)
+            } catch (e: Throwable) {
+                Log.e(TAG, "renderShade failed", e)
+            } finally {
+                if (canvas != null) try { surf.unlockCanvasAndPost(canvas) } catch (_: Throwable) {}
+            }
+        }
+    }
+
+    @JvmStatic
+    fun onNotificationsChanged() {
+        activity?.runOnUiThread { renderDockToSurface() }
+        if (shadeMode == ShadeTexture.MODE_NOTIFICATIONS) renderShade()
+    }
+
+    /** Called by native on trigger-down over the shade. Must not block: work goes to shadeExec. */
+    @JvmStatic
+    fun handleShadeHit(u: Float, v: Float) {
+        val a = activity ?: return
+        val hit = ShadeTexture.hitTest(u, v)
+        Log.i(TAG, "shade hit $hit")
+        var refresh = shadeMode == ShadeTexture.MODE_QUICK_SETTINGS
+        when (hit) {
+            ShadeTexture.Hit.None -> return
+            ShadeTexture.Hit.DndToggle -> shadeExec.submit { QuickSettings.setDnd(!QuickSettings.state.dnd) }
+            ShadeTexture.Hit.BoundaryToggle -> shadeExec.submit {
+                QuickSettings.setBoundaryOff(!QuickSettings.state.boundaryOff)
+                Thread.sleep(500)
+            }
+            ShadeTexture.Hit.WifiToggle -> shadeExec.submit {
+                QuickSettings.setWifi(!QuickSettings.state.wifiEnabled)
+                Thread.sleep(1500)
+            }
+            is ShadeTexture.Hit.WifiConnect -> shadeExec.submit {
+                Log.i(TAG, "wifi connect ${hit.id} -> ${injectorRequest("WIFI_CONNECT ${hit.id}")}")
+                Thread.sleep(3000)
+            }
+            is ShadeTexture.Hit.WifiJoin -> {
+                if (hit.network.secured) {
+                    ShadeTexture.joining = hit.network
+                    ShadeTexture.password = ""
+                    ShadeTexture.revealPassword = false
+                    ShadeTexture.resetScroll()
+                    keyboardCapture = ::passwordKey
+                    requestKbVisible(true)
+                    refresh = false
+                } else {
+                    shadeExec.submit { Log.i(TAG, "wifi join open ${hit.network.ssid} -> ${QuickSettings.addNetwork(hit.network.ssid, "")}"); Thread.sleep(3000) }
+                }
+            }
+            ShadeTexture.Hit.PasswordReveal -> { ShadeTexture.revealPassword = !ShadeTexture.revealPassword; refresh = false }
+            ShadeTexture.Hit.PasswordCancel -> endWifiJoin()
+            ShadeTexture.Hit.PasswordConnect -> submitWifiJoin()
+            ShadeTexture.Hit.VolumeDown -> { shadeExec.submit { QuickSettings.adjustVolume(a, false) }; refresh = false }
+            ShadeTexture.Hit.VolumeUp -> { shadeExec.submit { QuickSettings.adjustVolume(a, true) }; refresh = false }
+            ShadeTexture.Hit.ClearAll -> RoverNotificationService.dismissAll()
+            is ShadeTexture.Hit.DismissNotification -> RoverNotificationService.dismiss(hit.key)
+            is ShadeTexture.Hit.OpenNotification -> { endReply(); openNotification(hit.key); return }
+            is ShadeTexture.Hit.ToggleExpand -> {
+                if (ShadeTexture.replyKey != hit.key) endReply()
+                ShadeTexture.expandedKey = if (ShadeTexture.expandedKey == hit.key) null else hit.key
+            }
+            is ShadeTexture.Hit.NotificationAction -> {
+                val act = notificationAction(hit.key, hit.index) ?: return
+                try { act.actionIntent?.send() } catch (e: Throwable) { Log.e(TAG, "notification action failed", e) }
+            }
+            is ShadeTexture.Hit.ReplyStart -> {
+                ShadeTexture.replyKey = hit.key
+                ShadeTexture.replyAction = hit.index
+                ShadeTexture.replyText = ""
+                keyboardCapture = ::replyKeyInput
+                requestKbVisible(true)
+            }
+            ShadeTexture.Hit.ReplySend -> sendReply()
+            ShadeTexture.Hit.ReplyCancel -> endReply()
+        }
+        renderShade(refreshQuickSettings = refresh)
+    }
+
+    private fun notificationAction(key: String, index: Int): android.app.Notification.Action? =
+        RoverNotificationService.current().firstOrNull { it.key == key }?.notification?.actions?.getOrNull(index)
+
+    private fun replyKeyInput(action: Int, text: String) {
+        when (action) {
+            KeyboardTexture.ACT_BACKSPACE -> ShadeTexture.replyText = ShadeTexture.replyText.dropLast(1)
+            KeyboardTexture.ACT_ENTER -> { sendReply(); return }
+            KeyboardTexture.ACT_SPACE -> ShadeTexture.replyText += " "
+            else -> if (text.isNotEmpty()) ShadeTexture.replyText += text else return
+        }
+        renderShade()
+    }
+
+    /** Inline reply through the notification's RemoteInput, without opening the app. */
+    private fun sendReply() {
+        val a = activity ?: return
+        val key = ShadeTexture.replyKey ?: return
+        val text = ShadeTexture.replyText
+        val act = notificationAction(key, ShadeTexture.replyAction)
+        endReply()
+        val inputs = act?.remoteInputs
+        if (act == null || inputs.isNullOrEmpty() || text.isBlank()) return
+        try {
+            val results = android.os.Bundle().apply { putCharSequence(inputs[0].resultKey, text) }
+            val fill = Intent()
+            android.app.RemoteInput.addResultsToIntent(inputs, fill, results)
+            act.actionIntent.send(a, 0, fill)
+            Log.i(TAG, "reply sent to $key")
+        } catch (e: Throwable) { Log.e(TAG, "reply failed", e) }
+        renderShade()
+    }
+
+    private fun endReply() {
+        if (ShadeTexture.replyKey == null) return
+        ShadeTexture.replyKey = null
+        ShadeTexture.replyText = ""
+        keyboardCapture = null
+        requestKbVisible(false)
+    }
+
+    /** While set, rover's keyboard types into this instead of the focused app panel. */
+    @Volatile private var keyboardCapture: ((action: Int, text: String) -> Unit)? = null
+
+    private fun passwordKey(action: Int, text: String) {
+        when (action) {
+            KeyboardTexture.ACT_BACKSPACE -> ShadeTexture.password = ShadeTexture.password.dropLast(1)
+            KeyboardTexture.ACT_ENTER -> { submitWifiJoin(); return }
+            KeyboardTexture.ACT_SPACE -> ShadeTexture.password += " "
+            else -> if (text.isNotEmpty()) ShadeTexture.password += text else return
+        }
+        renderShade()
+    }
+
+    private fun submitWifiJoin() {
+        val n = ShadeTexture.joining ?: return
+        val pass = ShadeTexture.password
+        endWifiJoin()
+        shadeExec.submit {
+            Log.i(TAG, "wifi join ${n.ssid} -> ${QuickSettings.addNetwork(n.ssid, pass)}")
+            Thread.sleep(4000)
+        }
+        renderShade(refreshQuickSettings = true)
+    }
+
+    private fun endWifiJoin() {
+        if (ShadeTexture.joining == null) return
+        ShadeTexture.joining = null
+        ShadeTexture.password = ""
+        keyboardCapture = null
+        requestKbVisible(false)
+    }
+
+    // ---------- system panel scrolling (thumbstick over launcher / shade) ----------
+    @Volatile private var launcherRenderQueued = false
+    @Volatile private var shadeRenderQueued = false
+
+    @JvmStatic
+    fun scrollSystemPanel(panelIdx: Int, dy: Float) {
+        if (panelIdx == launcherPanelIdx) {
+            LauncherTexture.scrollBy(dy)
+            if (!launcherRenderQueued) {
+                launcherRenderQueued = true
+                activity?.runOnUiThread { launcherRenderQueued = false; renderLauncherToSurface() }
+            }
+        } else if (panelIdx == shadePanelIdx) {
+            ShadeTexture.scrollBy(dy)
+            if (!shadeRenderQueued) { shadeRenderQueued = true; renderShade() }
+        }
+    }
+
+    // ---------- notification pop-up ----------
+    @Volatile @JvmStatic var toastPanelIdx: Int = -1
+    @Volatile private var toastSurfaceTexture: android.graphics.SurfaceTexture? = null
+    @Volatile private var toastSurface: Surface? = null
+    @Volatile private var toastVisReq = -1
+    @Volatile private var toastKey: String? = null
+    private const val TOAST_W = 800
+    private const val TOAST_H = 118
+    private const val TOAST_MS = 5000L
+    private val toastSeen = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val toastHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val toastHide = Runnable { hideToast() }
+
+    @JvmStatic
+    fun setToastOesTextureId(panelIdx: Int, id: Int) {
+        toastPanelIdx = panelIdx
+        val st = android.graphics.SurfaceTexture(id).apply { setDefaultBufferSize(TOAST_W, TOAST_H) }
+        toastSurfaceTexture = st
+        toastSurface = Surface(st)
+    }
+
+    @JvmStatic
+    fun updateToastSurfaceTexImage(): Boolean {
+        val st = toastSurfaceTexture ?: return false
+        return try { st.updateTexImage(); true } catch (_: Throwable) { false }
+    }
+
+    @JvmStatic fun pollToastVisRequest(): Int { val r = toastVisReq; toastVisReq = -1; return r }
+
+    private fun hideToast() {
+        toastHandler.removeCallbacks(toastHide)
+        if (toastKey != null) { toastKey = null; toastVisReq = 0 }
+    }
+
+    /** New (not merely updated) notification: pop it up unless DND is on or the shade shows the list. */
+    @JvmStatic
+    fun onNotificationPosted(sbn: android.service.notification.StatusBarNotification) {
+        val a = activity ?: return
+        val n = sbn.notification
+        val seenAt = toastSeen.put(sbn.key, sbn.postTime)
+        val isUpdate = seenAt != null && (seenAt == sbn.postTime || n.flags and android.app.Notification.FLAG_ONLY_ALERT_ONCE != 0)
+        val nm = a.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+        val skip = when {
+            isUpdate -> "update"
+            n.flags and android.app.Notification.FLAG_ONGOING_EVENT != 0 -> "ongoing"
+            nm.currentInterruptionFilter > android.app.NotificationManager.INTERRUPTION_FILTER_ALL -> "dnd"
+            shadeMode == ShadeTexture.MODE_NOTIFICATIONS -> "list open"
+            else -> null
+        }
+        Log.i(TAG, "notification posted ${sbn.packageName} flags=0x${Integer.toHexString(n.flags)} popup=${skip ?: "yes"}")
+        if (skip != null) return
+        showToast(sbn.key, TOAST_MS) { c ->
+            ShadeTexture.drawNotificationCard(c, a, sbn, android.graphics.RectF(4f, 8f, TOAST_W - 4f, TOAST_H - 8f))
+        }
+    }
+
+    /** Pop-up next to the dock for [ms]; [key] = notification opened on tap, null for status messages. */
+    private fun showToast(key: String?, ms: Long, draw: (android.graphics.Canvas) -> Unit) {
+        shadeExec.submit {
+            val surf = toastSurface ?: return@submit
+            var canvas: android.graphics.Canvas? = null
+            try {
+                canvas = surf.lockCanvas(null)
+                canvas.drawColor(0, android.graphics.PorterDuff.Mode.CLEAR)
+                draw(canvas)
+            } catch (e: Throwable) { Log.e(TAG, "toast render failed", e) }
+            finally { if (canvas != null) try { surf.unlockCanvasAndPost(canvas) } catch (_: Throwable) {} }
+            toastKey = key
+            toastVisReq = 1
+            toastHandler.removeCallbacks(toastHide)
+            toastHandler.postDelayed(toastHide, ms)
+        }
+    }
+
+    private fun showStatus(text: String) = showToast(null, 2500L) { c ->
+        val r = android.graphics.RectF(4f, 8f, TOAST_W - 4f, TOAST_H - 8f)
+        c.drawRoundRect(r, 16f, 16f, android.graphics.Paint().apply { color = 0xE8262c38.toInt() })
+        c.drawText(text, r.centerX(), r.centerY() + 11f, android.graphics.Paint().apply {
+            color = android.graphics.Color.WHITE; textSize = 30f; isAntiAlias = true
+            textAlign = android.graphics.Paint.Align.CENTER
+        })
+    }
+
+    // ---------- global recording (Meta's recorder: clean single-eye view incl. passthrough) ----------
+    @Volatile private var recording = false
+
+    private fun toggleRecording() {
+        val start = !recording
+        recording = start
+        activity?.runOnUiThread { renderDockToSurface() }
+        shadeExec.submit {
+            val action = if (start) "START_INTERNAL_CAPTURE_TO_DISK" else "STOP_INTERNAL_CAPTURE_TO_DISK"
+            try {
+                Runtime.getRuntime().exec(arrayOf("su", "-c",
+                    "am startservice -n com.oculus.metacam/.capture.CaptureService -a $action")).waitFor()
+            } catch (e: Throwable) { Log.e(TAG, "recording $action failed", e) }
+            Log.i(TAG, "recording -> $start")
+        }
+        showStatus(if (start) "Recording" else "Recording saved to Oculus/VideoShots")
+    }
+
+    @JvmStatic fun stopRecordingIfActive() { if (recording) toggleRecording() }
+
+    // ---------- per-panel screenshots ----------
+    @Volatile private var captureReq = -1
+    @JvmStatic fun pollPanelCaptureRequest(): Int { val r = captureReq; captureReq = -1; return r }
+
+    /** Pixels of one panel as drawn (RGBA, bottom row first), saved as a PNG in Pictures/Rover. */
+    @JvmStatic
+    fun onPanelCaptured(panelIdx: Int, w: Int, h: Int, rgba: ByteArray) {
+        val a = activity ?: return
+        val name = hostedApps.firstOrNull { it.panelIdx == panelIdx }?.pkg?.substringAfterLast('.') ?: "panel"
+        shadeExec.submit {
+            try {
+                val raw = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
+                raw.copyPixelsFromBuffer(java.nio.ByteBuffer.wrap(rgba))
+                val out = android.graphics.Bitmap.createBitmap(w, h, android.graphics.Bitmap.Config.ARGB_8888)
+                val c = android.graphics.Canvas(out)
+                c.drawColor(android.graphics.Color.BLACK)  // panels may be translucent; photos shouldn't be
+                c.scale(1f, -1f, w / 2f, h / 2f)          // GL rows are bottom-up
+                c.drawBitmap(raw, 0f, 0f, null)
+                raw.recycle()
+                val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US).format(java.util.Date())
+                val values = android.content.ContentValues().apply {
+                    put(android.provider.MediaStore.Images.Media.DISPLAY_NAME, "$name-$stamp.png")
+                    put(android.provider.MediaStore.Images.Media.MIME_TYPE, "image/png")
+                    put(android.provider.MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Rover")
+                }
+                val uri = a.contentResolver.insert(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                    ?: throw IllegalStateException("MediaStore insert failed")
+                a.contentResolver.openOutputStream(uri)?.use { out.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
+                out.recycle()
+                Log.i(TAG, "screenshot saved $name-$stamp.png (${w}x$h)")
+                showStatus("Screenshot saved to Pictures/Rover")
+            } catch (e: Throwable) {
+                Log.e(TAG, "screenshot failed", e)
+                showStatus("Screenshot failed")
+            }
+        }
+    }
+
+    // ---------- per-app panel size ----------
+    /** Called by native when the user finishes resizing an app panel (meters). */
+    @JvmStatic
+    fun savePanelSize(panelIdx: Int, w: Float, h: Float) {
+        val a = activity ?: return
+        val pkg = hostedApps.firstOrNull { it.panelIdx == panelIdx }?.pkg ?: return
+        if (!validPanelSize(w, h)) return
+        a.getSharedPreferences("panelSizes", Context.MODE_PRIVATE).edit().putString(pkg, "$w,$h").apply()
+        Log.i(TAG, "panel size for $pkg saved: ${w}x$h m")
+    }
+
+    /** Last size of [pkg]'s panel, or null (native then uses the default). Never throws. */
+    @JvmStatic
+    fun panelSizeFor(pkg: String): FloatArray? = try {
+        val v = activity?.getSharedPreferences("panelSizes", Context.MODE_PRIVATE)?.getString(pkg, null)
+        val f = v?.split(",")?.mapNotNull { it.toFloatOrNull() }
+        if (f != null && f.size == 2 && validPanelSize(f[0], f[1])) floatArrayOf(f[0], f[1]) else null
+    } catch (_: Throwable) { null }
+
+    private fun validPanelSize(w: Float, h: Float) = w.isFinite() && h.isFinite() && w in 0.25f..4f && h in 0.2f..4f
+
+
+    @JvmStatic
+    fun handleToastHit(u: Float, v: Float) {
+        val key = toastKey ?: return
+        hideToast()
+        openNotification(key)
+    }
+
+    // ---------- dock placement persistence ----------
+    /** mode 1 = pinned (head-locked), 0 = body-locked; pose is head-relative. */
+    @JvmStatic
+    fun saveDockPose(mode: Int, px: Float, py: Float, pz: Float, qx: Float, qy: Float, qz: Float, qw: Float) {
+        val a = activity ?: return
+        a.getSharedPreferences("dock", Context.MODE_PRIVATE).edit()
+            .putString("pose", listOf(mode.toFloat(), px, py, pz, qx, qy, qz, qw).joinToString(",")).apply()
+    }
+
+    /** The user's pinned dock placement: head-relative pose + size. */
+    @JvmStatic
+    fun savePinnedDock(px: Float, py: Float, pz: Float, qx: Float, qy: Float, qz: Float, qw: Float, w: Float, h: Float) {
+        val a = activity ?: return
+        a.getSharedPreferences("dock", Context.MODE_PRIVATE).edit()
+            .putString("pinnedPose", listOf(px, py, pz, qx, qy, qz, qw, w, h).joinToString(",")).apply()
+    }
+
+    @JvmStatic
+    fun loadPinnedDock(): FloatArray? {
+        val a = activity ?: return null
+        val v = a.getSharedPreferences("dock", Context.MODE_PRIVATE).getString("pinnedPose", null) ?: return null
+        val f = v.split(",").mapNotNull { it.toFloatOrNull() }
+        return if (f.size == 9) f.toFloatArray() else null
+    }
+
+    @JvmStatic
+    fun loadDockPose(): FloatArray? {
+        val a = activity ?: return null
+        val v = a.getSharedPreferences("dock", Context.MODE_PRIVATE).getString("pose", null) ?: return null
+        val f = v.split(",").mapNotNull { it.toFloatOrNull() }
+        if (f.size != 8) return null
+        dockPinned = f[0] == 1f
+        a.runOnUiThread { renderDockToSurface() }
+        return f.toFloatArray()
+    }
+
+    @Volatile private var pendingSpawnPendingIntent: android.app.PendingIntent? = null
+
+    private fun openNotification(key: String) {
+        val sbn = RoverNotificationService.current().firstOrNull { it.key == key } ?: return
+        val pi = sbn.notification.contentIntent ?: return
+        val pkg = sbn.packageName
+        if (sbn.notification.flags and android.app.Notification.FLAG_AUTO_CANCEL != 0) RoverNotificationService.dismiss(key)
+        shadeMode = 0
+        shadeVisReq = 0
+        activity?.runOnUiThread { renderDockToSurface() }
+        val existing = hostedApps.lastOrNull { it.pkg == pkg }
+        if (existing != null) {
+            Thread { sendPendingIntentOnDisplay(pi, pkg, existing.vdId) }.start()
+        } else {
+            pendingSpawnPendingIntent = pi
+            requestSpawn(pkg, "")
+        }
+    }
+
+    /** Explicit launch display: keeps Meta's shell from capturing the start. */
+    private fun sendPendingIntentOnDisplay(pi: android.app.PendingIntent, pkg: String, displayId: Int) {
+        val a = activity ?: return
+        ensureInjectorRunning()
+        sendInject("EXEMPT $pkg")
+        launchedPackages.add(pkg)
+        val before = listPkgTasks(pkg).map { it.taskId }.toSet()
+        try {
+            val opts = android.app.ActivityOptions.makeBasic().setLaunchDisplayId(displayId)
+            pi.send(a, 0, null, null, null, null, opts.toBundle())
+            Log.i(TAG, "notification intent sent to display $displayId")
+        } catch (e: Throwable) { Log.e(TAG, "notification send failed", e); return }
+        // Trampoline activities re-launch without a display and Meta's shell captures them.
+        adoptTask(pkg, displayId, -1, before, 20)
     }
 
     // ============ v0.9.2: launcher grid ============
@@ -456,18 +930,22 @@ object RoverBridge {
 
     @JvmStatic
     fun handleLauncherHit(u: Float, v: Float) {
-        val idx = LauncherTexture.hitTile(u, v)
-        when (idx) {
-            -1 -> return
-            -2 -> { LauncherTexture.prevPage(); renderLauncherToSurface(); return }
-            -3 -> { LauncherTexture.nextPage(); renderLauncherToSurface(); return }
-            else -> {
-                val app = LauncherTexture.appAt(idx) ?: return
-                Log.i(TAG, "launcher tile hit idx=$idx pkg=${app.pkg}")
-                requestSpawn(app.pkg, app.activity)
+        when (val hit = LauncherTexture.hitTest(u, v)) {
+            LauncherTexture.Hit.None -> return
+            is LauncherTexture.Hit.Tab -> LauncherTexture.selectTab(hit.favorites)
+            is LauncherTexture.Hit.TogglePin -> {
+                val a = activity ?: return
+                LauncherTexture.togglePin(a, hit.app)
+                Log.i(TAG, "launcher pin toggled ${hit.app.key}")
+            }
+            is LauncherTexture.Hit.Launch -> {
+                Log.i(TAG, "launcher launch ${hit.app.pkg}")
+                requestSpawn(hit.app.pkg, hit.app.activity)
                 requestLauncherVisible(false)
+                return
             }
         }
+        renderLauncherToSurface()
     }
 
     private fun renderLauncherToSurface() {
@@ -525,6 +1003,14 @@ object RoverBridge {
         }
         if (panelIdx == dockPanelIdx) {
             val st = dockSurfaceTexture
+            if (st != null) { st.getTransformMatrix(out); return true }
+        }
+        if (panelIdx == toastPanelIdx) {
+            val st = toastSurfaceTexture
+            if (st != null) { st.getTransformMatrix(out); return true }
+        }
+        if (panelIdx == shadePanelIdx) {
+            val st = shadeSurfaceTexture
             if (st != null) { st.getTransformMatrix(out); return true }
         }
         if (panelIdx == launcherPanelIdx) {
@@ -619,6 +1105,10 @@ object RoverBridge {
             }
             4 -> {
                 // Slider grab; native tracks the drag
+            }
+            5 -> {
+                Log.i(TAG, "bar screenshot pi=$panelIdx")
+                captureReq = panelIdx
             }
         }
         return act
@@ -726,6 +1216,11 @@ object RoverBridge {
                 return
             }
             KeyboardTexture.ACT_CLOSE -> { requestKbVisible(false); return }
+        }
+        keyboardCapture?.let { cap ->
+            cap(hit.action, hit.text)
+            if (KeyboardTexture.handlePress(hit)) renderKeyboardToSurface()
+            return
         }
         // Non-modifier key path — build metaState from active mods so chords work (Ctrl+C etc.)
         val meta = KeyboardTexture.readMetaState()

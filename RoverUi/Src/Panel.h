@@ -47,6 +47,10 @@ struct Panel {
     bool isKeyboard = false;   // if true, hit-tests dispatch to KeyboardTexture (via JNI) instead of tap injection
     bool isDock = false;       // v0.9: persistent 3DoF dock — always visible, no bar, excluded from grip-rotate
     bool isLauncher = false;   // v0.9.2: app-launcher grid — no bar, excluded from grip-rotate
+    bool isShade = false;      // dock shade (quick settings / notifications), placed relative to the dock
+    bool isToast = false;      // notification pop-up, placed relative to the dock
+    // Rover's own UI: no bar, fixed size, excluded from grip-rotate, reflow and stick scrolling.
+    bool IsSystemUi() const { return isKeyboard || isDock || isLauncher || isShade || isToast; }
     bool visible = true;       // v0.7.2: false = skip in layer build + hit-test (hide keyboard)
     bool oesForceOpaque = true; // v0.7.2: false = OES blit preserves source alpha
     unsigned int barOesTexId = 0;   // v0.8-1b: if !=0, bar renders from Kotlin-drawn OES tex
@@ -163,7 +167,9 @@ public:
     void Shutdown();
     // Acquire panel swapchain, sample OES texture into it, release.
     // Returns false if setup failed (no-op).
-    bool BlitToPanel(Panel& p, unsigned int oesTexId, const float* stMatrix4x4 /*column-major, may be null*/);
+    // readback: if non-null, receives the panel's pixels (RGBA, bottom row first) after drawing.
+    bool BlitToPanel(Panel& p, unsigned int oesTexId, const float* stMatrix4x4 /*column-major, may be null*/,
+                     std::vector<uint8_t>* readback = nullptr);
     bool BlitToBar(Panel& p, unsigned int oesTexId, const float* stMatrix4x4);  // v0.8-1b: blit to p.barSwapchain
 private:
     unsigned int program_ = 0;

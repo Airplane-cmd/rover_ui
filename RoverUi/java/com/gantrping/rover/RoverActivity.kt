@@ -75,7 +75,8 @@ class RoverActivity : NativeActivity() {
                 Runtime.getRuntime().exec(arrayOf("su", "-c",
                     "v=$(settings get secure enabled_accessibility_services | tr ':' '\\n' | grep -v '^com.gantrping.rover/' | grep -v '^null$' | tr '\\n' ':' | sed 's/:$//'); " +
                     "settings put secure enabled_accessibility_services \"${'$'}{v:+${'$'}v:}com.gantrping.rover/com.gantrping.rover.RoverInputFilterService\"; " +
-                    "settings put secure accessibility_enabled 1")).waitFor()
+                    "settings put secure accessibility_enabled 1; " +
+                    "cmd notification allow_listener com.gantrping.rover/com.gantrping.rover.RoverNotificationService")).waitFor()
                 Log.i("RoverBridge", "input filter a11y service enabled")
             } catch (e: Throwable) { Log.e("RoverBridge", "a11y enable failed", e) }
         }.start()
@@ -99,7 +100,10 @@ class RoverActivity : NativeActivity() {
         try { unregisterReceiver(cfgReceiver) } catch (_: Throwable) {}
         // v0.9.3: only cleanup when user explicitly quits (isFinishing) — skip when Android
         // destroys the activity to reclaim memory, which would kill hosted apps unexpectedly.
-        if (isFinishing) RoverBridge.cleanupLaunchedApps()
+        if (isFinishing) {
+            RoverBridge.cleanupLaunchedApps()
+            RoverBridge.stopRecordingIfActive()
+        }
         RoverBridge.setActivity(null)
         // v0.8-fixes: re-enable all system IMEs (we disabled them at startup)
         Thread {

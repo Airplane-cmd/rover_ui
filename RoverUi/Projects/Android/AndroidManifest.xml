@@ -62,6 +62,14 @@
         android:name="com.gantrping.rover.MediaProjectionService"
         android:foregroundServiceType="mediaProjection"
         android:exported="false" />
+    <service
+        android:name="com.gantrping.rover.RoverNotificationService"
+        android:exported="false"
+        android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+      <intent-filter>
+        <action android:name="android.service.notification.NotificationListenerService" />
+      </intent-filter>
+    </service>
     <provider
         android:name="com.gantrping.rover.RoverSurfaceProvider"
         android:authorities="com.gantrping.rover.surfaces"

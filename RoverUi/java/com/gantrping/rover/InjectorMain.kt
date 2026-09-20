@@ -232,6 +232,47 @@ object InjectorMain {
                     log("DETACH ${parts[1]} -> $ok")
                     out.write("${if (ok) "OK" else "ERR"}\n".toByteArray()); out.flush()
                 }
+                "WIFI_CONNECT" -> {  // WIFI_CONNECT <networkId>
+                    val ok = try {
+                        val b = Class.forName("android.os.ServiceManager").getMethod("getService", String::class.java)
+                            .invoke(null, "wifi") as android.os.IBinder
+                        val wm = Class.forName("android.net.wifi.IWifiManager\$Stub")
+                            .getMethod("asInterface", android.os.IBinder::class.java).invoke(null, b)!!
+                        wm.javaClass.methods.first { it.name == "connect" && it.parameterTypes.size == 4 }
+                            .invoke(wm, null, parts[1].toInt(), null, "com.android.shell")
+                        true
+                    } catch (e: Throwable) {
+                        log("WIFI_CONNECT failed: ${(e as? java.lang.reflect.InvocationTargetException)?.targetException ?: e}"); false
+                    }
+                    out.write("${if (ok) "OK" else "ERR"}\n".toByteArray()); out.flush()
+                }
+                "WIFI_ADD" -> {  // WIFI_ADD <ssid b64url> <password b64url | ->
+                    val ok = try {
+                        fun dec(s: String) = String(android.util.Base64.decode(s, android.util.Base64.URL_SAFE))
+                        val ssid = dec(parts[1])
+                        val pass = if (parts[2] == "-") null else dec(parts[2])
+                        val cfg = android.net.wifi.WifiConfiguration().apply {
+                            SSID = "\"$ssid\""
+                            if (pass == null) {
+                                setSecurityParams(android.net.wifi.WifiConfiguration.SECURITY_TYPE_OPEN)
+                            } else {
+                                setSecurityParams(android.net.wifi.WifiConfiguration.SECURITY_TYPE_PSK)
+                                preSharedKey = "\"$pass\""
+                            }
+                        }
+                        val b = Class.forName("android.os.ServiceManager").getMethod("getService", String::class.java)
+                            .invoke(null, "wifi") as android.os.IBinder
+                        val wm = Class.forName("android.net.wifi.IWifiManager\$Stub")
+                            .getMethod("asInterface", android.os.IBinder::class.java).invoke(null, b)!!
+                        wm.javaClass.methods.first { it.name == "connect" && it.parameterTypes.size == 4 }
+                            .invoke(wm, cfg, -1, null, "com.android.shell")
+                        log("WIFI_ADD '$ssid' secured=${pass != null}")
+                        true
+                    } catch (e: Throwable) {
+                        log("WIFI_ADD failed: ${(e as? java.lang.reflect.InvocationTargetException)?.targetException ?: e}"); false
+                    }
+                    out.write("${if (ok) "OK" else "ERR"}\n".toByteArray()); out.flush()
+                }
                 "VD_RESIZE" -> TrustedDisplays.resize(parts[1].toInt(), parts[2].toInt(), parts[3].toInt(), parts[4].toInt())
                 "VD_RELEASE" -> TrustedDisplays.release(parts[1].toInt())
                 else -> log("unknown cmd: $line")

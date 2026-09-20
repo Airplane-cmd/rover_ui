@@ -413,7 +413,7 @@ void PanelManager::BuildLayers(XrCompositionLayerQuad* outQuads, int outCap, int
         if (p.dead) continue;
         if (!p.visible) continue;
         if (p.bodyHidden) continue;
-        if (p.isLauncher) continue;  // v0.9.3: draw launcher last
+        if (p.isLauncher || p.isShade || p.isDock || p.isToast) continue;  // overlays: drawn last, in front of apps
         if (p.isKeyboard) continue;  // v0.9.5: draw keyboard last too
         XrPosef world = ResolveWorldPose(i, headPoseInLocal);
         world.orientation = QNorm(world.orientation);
@@ -434,7 +434,7 @@ void PanelManager::BuildLayers(XrCompositionLayerQuad* outQuads, int outCap, int
     for (int i = 0; i < static_cast<int>(panels_.size()); i++) {
         if (count >= outCap) break;
         const Panel& p = panels_[i];
-        if (!(p.isLauncher || p.isKeyboard) || p.dead || !p.visible || p.bodyHidden) continue;
+        if (!(p.isLauncher || p.isKeyboard || p.isShade || p.isDock || p.isToast) || p.dead || !p.visible || p.bodyHidden) continue;
         XrPosef world = ResolveWorldPose(i, headPoseInLocal);
         world.orientation = QNorm(world.orientation);
         if (!VecFinite(world.position)) continue;
@@ -457,7 +457,7 @@ void PanelManager::BuildLayers(XrCompositionLayerQuad* outQuads, int outCap, int
         const Panel& p = panels_[i];
         if (p.dead) continue;         // v0.8.4 #14
         if (!p.visible) continue;
-        if (p.isKeyboard || p.isDock || p.isLauncher) continue;  // v0.9.2: kb/dock/launcher no bar
+        if (p.IsSystemUi()) continue;  // v0.9.2: kb/dock/launcher no bar
         XrPosef world = ResolveWorldPose(i, headPoseInLocal);
         float barH = p.barHovered ? BAR_HOVER_HEIGHT_M : BAR_HEIGHT_M;
         float barW = p.size.width * (p.barHovered ? BAR_HOVER_WIDTH_RATIO : BAR_WIDTH_RATIO);
@@ -798,7 +798,8 @@ void OesBlitter::Shutdown() {
     vbo_ = vao_ = program_ = 0; ready_ = false;
 }
 
-bool OesBlitter::BlitToPanel(Panel& p, unsigned int oesTexId, const float* stMatrix4x4) {
+bool OesBlitter::BlitToPanel(Panel& p, unsigned int oesTexId, const float* stMatrix4x4,
+                             std::vector<uint8_t>* readback) {
     if (!ready_ || oesTexId == 0) return false;
     if (p.swapchain == XR_NULL_HANDLE) return false;
 
@@ -841,6 +842,11 @@ bool OesBlitter::BlitToPanel(Panel& p, unsigned int oesTexId, const float* stMat
     glBindVertexArray(vao_);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glBindVertexArray(0);
+    if (readback) {
+        readback->resize(static_cast<size_t>(p.width) * p.height * 4);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(0, 0, p.width, p.height, GL_RGBA, GL_UNSIGNED_BYTE, readback->data());
+    }
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
     glUseProgram(0);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);

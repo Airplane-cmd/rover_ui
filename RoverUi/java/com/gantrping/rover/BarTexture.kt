@@ -17,7 +17,7 @@ import kotlin.math.min
  * Hover: full bar with [app-name] [alpha-slider] [Hide][DoF][Close].
  *
  * Coordinate model: sub-hit-test operates on u (0..1 across bar).
- * Returns action codes: 0=drag, 1=close, 2=hide, 3=dof, 4=slider-grab.
+ * Returns action codes: 0=drag, 1=close, 2=hide, 3=dof, 4=slider-grab, 5=screenshot.
  */
 object BarTexture {
     const val W = 1024
@@ -26,8 +26,9 @@ object BarTexture {
     // Layout in u-space (0..1 across bar), for hover mode only
     private const val NAME_END = 0.38f       // 0..NAME_END = app name area
     private const val SLIDER_START = 0.42f
-    private const val SLIDER_END = 0.70f     // slider between these
-    private const val BTN_HIDE_END = 0.80f   // buttons after slider
+    private const val SLIDER_END = 0.62f     // slider between these
+    private const val BTN_SHOT_END = 0.71f   // buttons after slider
+    private const val BTN_HIDE_END = 0.80f
     private const val BTN_DOF_END = 0.90f
     private const val BTN_CLOSE_END = 1.00f
 
@@ -36,7 +37,8 @@ object BarTexture {
         // v0.8.3 #7: only the button region maps to action; the blank gap is drag.
         if (u < SLIDER_START) return 0                             // name / gap → drag
         if (u < SLIDER_END) return 4                                // slider
-        if (u >= SLIDER_END && u < BTN_HIDE_END) return 2           // hide
+        if (u >= SLIDER_END && u < BTN_SHOT_END) return 5           // screenshot
+        if (u >= BTN_SHOT_END && u < BTN_HIDE_END) return 2         // hide
         if (u >= BTN_HIDE_END && u < BTN_DOF_END) return 3          // dof
         if (u >= BTN_DOF_END && u < BTN_CLOSE_END) return 1         // close
         return 0
@@ -101,7 +103,16 @@ object BarTexture {
                 val cy = H / 2f + label.textSize / 3f
                 canvas.drawText(txt, cx, cy, label)
             }
-            drawButton(SLIDER_END, BTN_HIDE_END, btnFill, "⌄")
+            drawButton(SLIDER_END, BTN_SHOT_END, btnFill, "")
+            run {  // camera: body + lens
+                val cx = (SLIDER_END + BTN_SHOT_END) / 2f * W
+                val cy = H / 2f
+                val line = Paint().apply { color = Color.WHITE; isAntiAlias = true; style = Paint.Style.STROKE; strokeWidth = 3f }
+                canvas.drawRoundRect(RectF(cx - 17f, cy - 10f, cx + 17f, cy + 13f), 5f, 5f, line)
+                canvas.drawRect(RectF(cx - 7f, cy - 15f, cx + 5f, cy - 10f), line)
+                canvas.drawCircle(cx, cy + 1.5f, 6.5f, line)
+            }
+            drawButton(BTN_SHOT_END, BTN_HIDE_END, btnFill, "⌄")
             drawButton(BTN_HIDE_END, BTN_DOF_END, btnFill, dofLabel)
             drawButton(BTN_DOF_END, BTN_CLOSE_END, closeFill, "✕")
         }

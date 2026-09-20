@@ -647,6 +647,18 @@ static GLuint g_dockOesTextureId = 0;
 static int g_dockPanelIdx = -1;
 static GLuint g_launcherOesTextureId = 0;
 static int g_launcherPanelIdx = -1;
+static GLuint g_shadeOesTextureId = 0;
+static int g_shadePanelIdx = -1;
+static const XrPosef kDockDefaultPose = {{0,0,0,1}, {0.0f, -0.35f, -0.7f}};
+static const XrPosef kDockPinnedPose = {{0,0,0,1}, {0.0f, 0.18f, -0.7f}};
+static const XrExtent2Df kDockSize = {0.48f, 0.08f};
+static int g_captureIdx = -1;   // panel whose next blit is also saved as a screenshot
+// The user's own pinned placement: saved whenever they move/resize the dock while pinned.
+static bool g_hasPinnedDock = false;
+static XrPosef g_pinnedDockPose = kDockPinnedPose;
+static XrExtent2Df g_pinnedDockSize = kDockSize;
+static GLuint g_toastOesTextureId = 0;
+static int g_toastPanelIdx = -1;
 // v0.8.5: deferred destroy queue — actual GL/XR destruction happens N frames after close request
 struct PendingKill { int idx; GLuint bodyTex; GLuint barTex; int framesLeft; };
 static std::vector<PendingKill> g_pendingKills;
@@ -1297,6 +1309,179 @@ static void CallStick(struct android_app* androidApp, const char* name, const ch
     if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
 }
 
+static JNIEnv* BridgeEnv(struct android_app* androidApp) {
+    JNIEnv* env = nullptr;
+    androidApp->activity->vm->AttachCurrentThread(&env, nullptr);
+    if (!env) return nullptr;
+    CacheBridgeClass(androidApp, env);
+    return g_bridgeCls ? env : nullptr;
+}
+
+static int CallBridgeInt(struct android_app* androidApp, const char* name) {
+    JNIEnv* env = BridgeEnv(androidApp);
+    if (!env) return -1;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, name, "()I");
+    if (!m) { env->ExceptionClear(); return -1; }
+    jint r = env->CallStaticIntMethod(g_bridgeCls, m);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); return -1; }
+    return r;
+}
+
+static void CallBridgeUV(struct android_app* androidApp, const char* name, float u, float v) {
+    JNIEnv* env = BridgeEnv(androidApp);
+    if (!env) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, name, "(FF)V");
+    if (!m) { env->ExceptionClear(); return; }
+    env->CallStaticVoidMethod(g_bridgeCls, m, (jfloat)u, (jfloat)v);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
+static void CallBridgeUpdateTex(struct android_app* androidApp, const char* name) {
+    JNIEnv* env = BridgeEnv(androidApp);
+    if (!env) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, name, "()Z");
+    if (!m) { env->ExceptionClear(); return; }
+    env->CallStaticBooleanMethod(g_bridgeCls, m);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
+static XrQuaternionf RvQMul(const XrQuaternionf& a, const XrQuaternionf& b) {
+    return { a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+             a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+             a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
+             a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z };
+}
+
+static XrVector3f RvQRot(const XrQuaternionf& q, const XrVector3f& v) {
+    XrQuaternionf p = {v.x, v.y, v.z, 0};
+    XrQuaternionf r = RvQMul(RvQMul(q, p), {-q.x, -q.y, -q.z, q.w});
+    return {r.x, r.y, r.z};
+}
+
+static void CallBridgeIF(struct android_app* androidApp, const char* name, int i, float f) {
+    JNIEnv* env = BridgeEnv(androidApp);
+    if (!env) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, name, "(IF)V");
+    if (!m) { env->ExceptionClear(); return; }
+    env->CallStaticVoidMethod(g_bridgeCls, m, (jint)i, (jfloat)f);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
+static void CallBridgeSaveDock(struct android_app* androidApp, int mode, const XrPosef& p) {
+    JNIEnv* env = BridgeEnv(androidApp);
+    if (!env) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "saveDockPose", "(IFFFFFFF)V");
+    if (!m) { env->ExceptionClear(); return; }
+    env->CallStaticVoidMethod(g_bridgeCls, m, (jint)mode, p.position.x, p.position.y, p.position.z,
+                              p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
+static void CallBridgeSavePinnedDock(struct android_app* androidApp, const XrPosef& p, const XrExtent2Df& s) {
+    JNIEnv* env = BridgeEnv(androidApp);
+    if (!env) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "savePinnedDock", "(FFFFFFFFF)V");
+    if (!m) { env->ExceptionClear(); return; }
+    env->CallStaticVoidMethod(g_bridgeCls, m, p.position.x, p.position.y, p.position.z,
+                              p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w, s.width, s.height);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
+static bool CallBridgeLoadPinnedDock(struct android_app* androidApp, XrPosef& p, XrExtent2Df& s) {
+    JNIEnv* env = BridgeEnv(androidApp);
+    if (!env) return false;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "loadPinnedDock", "()[F");
+    if (!m) { env->ExceptionClear(); return false; }
+    jfloatArray arr = (jfloatArray)env->CallStaticObjectMethod(g_bridgeCls, m);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); return false; }
+    if (!arr) return false;
+    float f[9];
+    bool ok = env->GetArrayLength(arr) == 9;
+    if (ok) {
+        env->GetFloatArrayRegion(arr, 0, 9, f);
+        p = {{f[3], f[4], f[5], f[6]}, {f[0], f[1], f[2]}};
+        s = {f[7], f[8]};
+    }
+    env->DeleteLocalRef(arr);
+    return ok;
+}
+
+static void CallBridgePanelCaptured(struct android_app* androidApp, int panelIdx, int w, int h,
+                                    const std::vector<uint8_t>& px) {
+    JNIEnv* env = BridgeEnv(androidApp);
+    if (!env) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "onPanelCaptured", "(III[B)V");
+    if (!m) { env->ExceptionClear(); return; }
+    jbyteArray arr = env->NewByteArray((jsize)px.size());
+    if (!arr) { env->ExceptionClear(); return; }
+    env->SetByteArrayRegion(arr, 0, (jsize)px.size(), reinterpret_cast<const jbyte*>(px.data()));
+    env->CallStaticVoidMethod(g_bridgeCls, m, (jint)panelIdx, (jint)w, (jint)h, arr);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+    env->DeleteLocalRef(arr);
+}
+
+static void CallBridgeSavePanelSize(struct android_app* androidApp, int panelIdx, const XrExtent2Df& s) {
+    JNIEnv* env = BridgeEnv(androidApp);
+    if (!env) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "savePanelSize", "(IFF)V");
+    if (!m) { env->ExceptionClear(); return; }
+    env->CallStaticVoidMethod(g_bridgeCls, m, (jint)panelIdx, (jfloat)s.width, (jfloat)s.height);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
+// Last size the user gave this app's panel (meters), validated on the Kotlin side.
+static bool CallBridgePanelSizeFor(struct android_app* androidApp, const std::string& pkg, XrExtent2Df& out) {
+    JNIEnv* env = BridgeEnv(androidApp);
+    if (!env) return false;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "panelSizeFor", "(Ljava/lang/String;)[F");
+    if (!m) { env->ExceptionClear(); return false; }
+    jstring jp = env->NewStringUTF(pkg.c_str());
+    jfloatArray arr = (jfloatArray)env->CallStaticObjectMethod(g_bridgeCls, m, jp);
+    env->DeleteLocalRef(jp);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); return false; }
+    if (!arr) return false;
+    float f[2];
+    bool ok = env->GetArrayLength(arr) == 2;
+    if (ok) { env->GetFloatArrayRegion(arr, 0, 2, f); out = {f[0], f[1]}; }
+    env->DeleteLocalRef(arr);
+    return ok;
+}
+
+// Record the dock's placement if it is pinned (head-locked): it becomes the pinned placement.
+static void RememberPinnedDock(struct android_app* androidApp, const rover::Panel& d) {
+    if (d.dofMode != rover::DofMode::HeadLocked) return;
+    g_hasPinnedDock = true;
+    g_pinnedDockPose = d.pose;
+    g_pinnedDockSize = d.size;
+    CallBridgeSavePinnedDock(androidApp, d.pose, d.size);
+    ALOGE("[rover-dock] pinned placement saved pos=(%.3f,%.3f,%.3f) size=(%.3f,%.3f)",
+          d.pose.position.x, d.pose.position.y, d.pose.position.z, d.size.width, d.size.height);
+}
+
+// out: mode, px, py, pz, qx, qy, qz, qw. False if nothing was saved.
+static bool CallBridgeLoadDock(struct android_app* androidApp, float out[8]) {
+    JNIEnv* env = BridgeEnv(androidApp);
+    if (!env) return false;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, "loadDockPose", "()[F");
+    if (!m) { env->ExceptionClear(); return false; }
+    jfloatArray arr = (jfloatArray)env->CallStaticObjectMethod(g_bridgeCls, m);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); return false; }
+    if (!arr) return false;
+    bool ok = env->GetArrayLength(arr) == 8;
+    if (ok) env->GetFloatArrayRegion(arr, 0, 8, out);
+    env->DeleteLocalRef(arr);
+    return ok;
+}
+
+static void CallBridgeSetTex(struct android_app* androidApp, const char* name, int panelIdx, GLuint tex) {
+    JNIEnv* env = BridgeEnv(androidApp);
+    if (!env) return;
+    jmethodID m = env->GetStaticMethodID(g_bridgeCls, name, "(II)V");
+    if (!m) { env->ExceptionClear(); return; }
+    env->CallStaticVoidMethod(g_bridgeCls, m, (jint)panelIdx, (jint)tex);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+}
+
 // v0.4.2b: kick off MediaProjection consent dialog once at startup
 static void CallRequestMediaProjection(struct android_app* androidApp) {
     JavaVM* jvm = androidApp->activity->vm;
@@ -1859,15 +2044,26 @@ int main() {
         panelMgr.PanelAt(kbIdx).oesForceOpaque = false;  // v0.7.2: preserve alpha so key-gap bg is transparent
 
         // v0.9: persistent dock — BodyLocked, small, below eye level, always visible
-        XrPosef dockPose = {{0,0,0,1}, {0.0f, -0.35f, -0.7f}};
+        XrPosef dockPose = kDockDefaultPose;
         int dockIdx = panelMgr.AddPanel(rover::DofMode::BodyLocked, dockPose,
-                                        {0.32f, 0.08f}, 0.10f, 0.10f, 0.10f, 0.0f, 512, 128);
+                                        kDockSize, 0.10f, 0.10f, 0.10f, 0.0f, 1152, 128);
         panelMgr.PanelAt(dockIdx).oesSourced = true;
         panelMgr.PanelAt(dockIdx).isDock = true;
         panelMgr.PanelAt(dockIdx).visible = true;
         panelMgr.PanelAt(dockIdx).oesForceOpaque = false;   // transparent gaps
         panelMgr.PanelAt(dockIdx).pendingHeadAlign = true;  // face user at first frame
         g_dockPanelIdx = dockIdx;
+        {
+            g_hasPinnedDock = CallBridgeLoadPinnedDock(androidApp, g_pinnedDockPose, g_pinnedDockSize);
+            float f[8];
+            if (CallBridgeLoadDock(androidApp, f) && f[0] == 1.0f) {   // saved pinned flag
+                auto& d = panelMgr.PanelAt(dockIdx);
+                d.pose = g_pinnedDockPose;
+                d.size = g_pinnedDockSize;
+                d.dofMode = rover::DofMode::HeadLocked;
+                d.pendingHeadAlign = false;
+            }
+        }
         CallSetupDockOesTexture(androidApp, dockIdx);
         panelMgr.PanelAt(dockIdx).oesTextureId = g_dockOesTextureId;
 
@@ -1882,6 +2078,43 @@ int main() {
         g_launcherPanelIdx = launcherIdx;
         CallSetupLauncherOesTexture(androidApp, launcherIdx);
         panelMgr.PanelAt(launcherIdx).oesTextureId = g_launcherOesTextureId;
+
+        // Dock shade (quick settings / notifications). Hidden; positioned next to the dock each frame.
+        glGenTextures(1, &g_shadeOesTextureId);
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, g_shadeOesTextureId);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+        XrPosef shadePose = {{0,0,0,1}, {0.0f, -0.13f, -0.7f}};
+        int shadeIdx = panelMgr.AddPanel(rover::DofMode::BodyLocked, shadePose,
+                                         {0.40f, 0.34f}, 0.0f, 0.0f, 0.0f, 0.0f, 800, 680);
+        panelMgr.PanelAt(shadeIdx).oesSourced = true;
+        panelMgr.PanelAt(shadeIdx).isShade = true;
+        panelMgr.PanelAt(shadeIdx).visible = false;
+        panelMgr.PanelAt(shadeIdx).oesForceOpaque = false;
+        panelMgr.PanelAt(shadeIdx).oesTextureId = g_shadeOesTextureId;
+        g_shadePanelIdx = shadeIdx;
+        CallBridgeSetTex(androidApp, "setShadeOesTextureId", shadeIdx, g_shadeOesTextureId);
+
+        // Notification pop-up, next to the dock like the shade.
+        glGenTextures(1, &g_toastOesTextureId);
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, g_toastOesTextureId);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+        int toastIdx = panelMgr.AddPanel(rover::DofMode::BodyLocked, shadePose,
+                                         {0.40f, 0.059f}, 0.0f, 0.0f, 0.0f, 0.0f, 800, 118);
+        panelMgr.PanelAt(toastIdx).oesSourced = true;
+        panelMgr.PanelAt(toastIdx).isToast = true;
+        panelMgr.PanelAt(toastIdx).visible = false;
+        panelMgr.PanelAt(toastIdx).oesForceOpaque = false;
+        panelMgr.PanelAt(toastIdx).oesTextureId = g_toastOesTextureId;
+        g_toastPanelIdx = toastIdx;
+        CallBridgeSetTex(androidApp, "setToastOesTextureId", toastIdx, g_toastOesTextureId);
         g_kbPanelIdx = kbIdx;
         {
             // v0.8-fixes: tell Kotlin the keyboard's panelIdx so it can return its STMatrix
@@ -2450,6 +2683,24 @@ int main() {
             }
         }
         {
+            int sreq = CallBridgeInt(androidApp, "pollShadeVisRequest");
+            if (sreq >= 0 && g_shadePanelIdx >= 0) panelMgr.PanelAt(g_shadePanelIdx).visible = (sreq == 1);
+            int creq = CallBridgeInt(androidApp, "pollPanelCaptureRequest");
+            if (creq >= 0) g_captureIdx = creq;
+            int treq = CallBridgeInt(androidApp, "pollToastVisRequest");
+            if (treq >= 0 && g_toastPanelIdx >= 0) panelMgr.PanelAt(g_toastPanelIdx).visible = (treq == 1);
+            int preq = CallBridgeInt(androidApp, "pollDockPinRequest");
+            if (preq >= 0 && g_dockPanelIdx >= 0) {
+                // Pinned: head-locked along the top of the view. Unpinned: body-locked below eye level.
+                auto& d = panelMgr.PanelAt(g_dockPanelIdx);
+                d.pose = preq == 1 ? g_pinnedDockPose : kDockDefaultPose;
+                d.size = preq == 1 ? g_pinnedDockSize : kDockSize;
+                d.dofMode = preq == 1 ? rover::DofMode::HeadLocked : rover::DofMode::BodyLocked;
+                d.pendingHeadAlign = preq != 1;
+                CallBridgeSaveDock(androidApp, preq, d.pose);
+            }
+        }
+        {
             // v0.8-1a: process pending spawn — create OES tex, add panel, notify Kotlin
             std::string pa = CallPollSpawnRequest(androidApp);
             if (!pa.empty()) {
@@ -2467,7 +2718,7 @@ int main() {
                 int liveHosted = 0;
                 for (int i = 0; i < (int)panelMgr.Panels().size(); i++) {
                     const auto& pp = panelMgr.PanelAt(i);
-                    if (pp.oesSourced && !pp.isKeyboard && !pp.isDock && !pp.isLauncher
+                    if (pp.oesSourced && !pp.IsSystemUi()
                         && !pp.dead && pp.visible) liveHosted++;
                 }
                 float g_spawnCursorX;
@@ -2491,9 +2742,19 @@ int main() {
                 XrVector3f headRelOffset = {g_spawnCursorX, 0.0f, -1.5f};
                 XrVector3f worldOffset = qrotV(headInLocal.orientation, headRelOffset);
                 XrPosef spawnPose = {headInLocal.orientation, worldOffset};
+                XrExtent2Df spawnSize = {0.9f, 0.6f};
                 int w = 900, h = 600;
+                XrExtent2Df saved;
+                if (CallBridgePanelSizeFor(androidApp, pa.substr(0, pa.find('|')), saved)) {
+                    // same pixel mapping and limits as the reflow commit below
+                    float ppm = CallGetPixelsPerMeter(androidApp);
+                    int sw = (int)(saved.width * ppm), sh = (int)(saved.height * ppm);
+                    if (sw >= 320 && sh >= 240 && sw <= 8192 && sh <= 8192) {
+                        spawnSize = saved; w = sw; h = sh;
+                    }
+                }
                 int newIdx = panelMgr.AddPanel(rover::DofMode::BodyLocked, spawnPose,
-                    {0.9f, 0.6f}, 0.10f, 0.10f, 0.10f, 1.0f, w, h);
+                    spawnSize, 0.10f, 0.10f, 0.10f, 1.0f, w, h);
                 panelMgr.PanelAt(newIdx).oesSourced = true;
                 panelMgr.PanelAt(newIdx).oesTextureId = newTex;
                 panelMgr.PanelAt(newIdx).oesForceOpaque = true;
@@ -2604,6 +2865,23 @@ int main() {
                 ALOGE("[rover-dof] panel=%zu head-aligned pose", pi);
             }
         }
+        // Shade hangs off the dock: above it when the dock is at the bottom, below when pinned on top.
+        // Shade and pop-up hang off the dock: above it, or below it when the dock sits high in view.
+        for (int idx : {g_shadePanelIdx, g_toastPanelIdx}) {
+            if (idx < 0 || g_dockPanelIdx < 0 || !panelMgr.PanelAt(idx).visible) continue;
+            const auto& d = panelMgr.PanelAt(g_dockPanelIdx);
+            if (d.pendingHeadAlign) continue;
+            auto& sh = panelMgr.PanelAt(idx);
+            float dy = (d.size.height + sh.size.height) * 0.5f + 0.015f;
+            XrVector3f dockInHead = d.dofMode == rover::DofMode::HeadLocked ? d.pose.position
+                : RvQRot({-headInLocal.orientation.x, -headInLocal.orientation.y, -headInLocal.orientation.z,
+                          headInLocal.orientation.w}, d.pose.position);
+            if (dockInHead.y > 0.0f) dy = -dy;
+            XrVector3f off = RvQRot(d.pose.orientation, {0.0f, dy, 0.0f});
+            sh.dofMode = d.dofMode;
+            sh.pose.orientation = d.pose.orientation;
+            sh.pose.position = { d.pose.position.x + off.x, d.pose.position.y + off.y, d.pose.position.z + off.z };
+        }
         if (rightCtrlValid) rightHit = panelMgr.Raycast(rightCtrl.position, computeRayDir(rightCtrl.orientation), headInLocal);
         if (leftCtrlValid)  leftHit  = panelMgr.Raycast(leftCtrl.position,  computeRayDir(leftCtrl.orientation),  headInLocal);
 
@@ -2701,7 +2979,7 @@ int main() {
                 prevCtrlOri = ctrlPose.orientation;  // v0.8.2/A3: baseline for this session
                 for (int pi = 0; pi < panelCount; pi++) {
                     const auto& pp = panelMgr.PanelAt(pi);
-                    if (pp.isKeyboard || pp.isDock || pp.isLauncher) { capturedValid[pi] = false; continue; }
+                    if (pp.IsSystemUi()) { capturedValid[pi] = false; continue; }
                     XrPosef w = panelMgr.ResolveWorldPose(pi, headInLocal);
                     capturedPose[pi] = w;
                     capturedHeadRel[pi] = {w.position.x - headInLocal.position.x,
@@ -2852,6 +3130,9 @@ int main() {
             bool grabValid   = (resizedHand == 1) ? leftCtrlValid : rightCtrlValid;
             XrPosef grabCtrl = (resizedHand == 1) ? leftCtrl : rightCtrl;
             if (!grabTrigger || !grabValid) {
+                if (resizedIdx == g_dockPanelIdx) RememberPinnedDock(androidApp, panelMgr.PanelAt(resizedIdx));
+                else if (!panelMgr.PanelAt(resizedIdx).IsSystemUi())
+                    CallBridgeSavePanelSize(androidApp, resizedIdx, panelMgr.PanelAt(resizedIdx).size);
                 resizedIdx = -1;
                 resizedHand = 0;
                 panelMgr.SetHovered(-1);
@@ -2994,6 +3275,10 @@ int main() {
                         if (pRef.isLauncher) {
                             ALOGE("[rover-launcher] press pi=%d uv=(%.3f,%.3f)", useHit.panelIdx, uv_u, uv_v);
                             CallHandleLauncherHit(androidApp, uv_u, uv_v);
+                        } else if (pRef.isToast) {
+                            CallBridgeUV(androidApp, "handleToastHit", uv_u, uv_v);
+                        } else if (pRef.isShade) {
+                            CallBridgeUV(androidApp, "handleShadeHit", uv_u, uv_v);
                         } else if (pRef.isDock) {
                             ALOGE("[rover-dock] press pi=%d uv=(%.3f,%.3f)", useHit.panelIdx, uv_u, uv_v);
                             CallHandleDockHit(androidApp, uv_u, uv_v);
@@ -3174,6 +3459,7 @@ int main() {
             }
             panelMgr.CommitWorldPose(grabbedIdx, liveWorld, headInLocal);
             if (!grabTrigger || !grabValid) {
+                if (grabbedIdx == g_dockPanelIdx) RememberPinnedDock(androidApp, panelMgr.PanelAt(grabbedIdx));
                 grabbedIdx = -1;
                 grabbedHand = 0;
                 panelMgr.SetHovered(-1);
@@ -3196,7 +3482,7 @@ int main() {
             for (int pi = 0; pi < (int)panelMgr.Panels().size(); ++pi) {
                 const auto& pp = panelMgr.PanelAt(pi);
                 if (!pp.oesSourced) continue;
-                if (pp.isKeyboard || pp.isDock || pp.isLauncher) continue;  // kb/dock/launcher fixed-size
+                if (pp.IsSystemUi()) continue;  // kb/dock/launcher fixed-size
                 ReflowState& st = refl[pi];
                 bool sizeChanged = (std::fabs(pp.size.width  - st.lastW) > eps) ||
                                    (std::fabs(pp.size.height - st.lastH) > eps);
@@ -3348,6 +3634,27 @@ int main() {
             }
         }
 
+        // Thumbstick over the launcher or shade scrolls its (Kotlin-drawn) list.
+        {
+            static long lastSysScrollMs = 0;
+            long nowSys = (long)(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+            float dt = lastSysScrollMs == 0 ? 0.0f : (float)std::min(nowSys - lastSysScrollMs, 50L) / 1000.0f;
+            lastSysScrollMs = nowSys;
+            for (int hand = 1; hand <= 2; hand++) {
+                if (hand == tapHand || hand == grabbedHand) continue;
+                const rover::HitResult& h = (hand == 1) ? leftHit : rightHit;
+                if (h.panelIdx < 0) continue;
+                const auto& p = panelMgr.PanelAt(h.panelIdx);
+                if (!(p.isLauncher || p.isShade)) continue;
+                float sy = (hand == 1) ? leftThumbState.currentState.y : rightThumbState.currentState.y;
+                if (std::fabs(sy) < 0.15f) continue;
+                float n = (std::fabs(sy) - 0.15f) / 0.85f;
+                CallBridgeIF(androidApp, "scrollSystemPanel", h.panelIdx, (sy > 0 ? -1.0f : 1.0f) * n * n * 1600.0f * dt);
+                break;
+            }
+        }
+
         // v1.1: thumbstick = a synthetic finger dragging the content under the ray. The daemon steps
         // the finger at a fixed cadence (smooth); we stream velocity and the ray's anchor pixel.
         {
@@ -3384,7 +3691,7 @@ int main() {
                     const rover::HitResult& h = (hand == 1) ? leftHit : rightHit;
                     if (h.panelIdx < 0 || h.hitBar || h.cornerIdx >= 0) continue;
                     const auto& p = panelMgr.PanelAt(h.panelIdx);
-                    if (!p.oesSourced || p.isKeyboard || p.isDock || p.isLauncher) continue;
+                    if (!p.oesSourced || p.IsSystemUi()) continue;
                     int x, y;
                     if (!rayToPanelPx(h.panelIdx, hand, x, y)) continue;
                     int did = CallPanelIdxToDisplayId(androidApp, h.panelIdx);
@@ -3463,6 +3770,8 @@ int main() {
             CallUpdateAllBarTexImages(androidApp);
             CallUpdateDockSurfaceTexImage(androidApp);
             CallUpdateLauncherSurfaceTexImage(androidApp);
+            CallBridgeUpdateTex(androidApp, "updateShadeSurfaceTexImage");
+            CallBridgeUpdateTex(androidApp, "updateToastSurfaceTexImage");
 for (int pi = 0; pi < (int)panelMgr.Panels().size(); pi++) {
                     if (panelMgr.PanelAt(pi).oesSourced) {
                         float kStMat[16]; bool haveMat = CallGetSTMatrixForPanel(androidApp, (int)pi, kStMat);
@@ -3478,7 +3787,15 @@ for (int pi = 0; pi < (int)panelMgr.Panels().size(); pi++) {
                         if (!panelMgr.PanelAt(pi).visible) continue;
                         GLuint useTex = panelMgr.PanelAt(pi).oesTextureId ? panelMgr.PanelAt(pi).oesTextureId : g_oesTextureId;
                         const float* useStMat = haveMat ? kStMat : nullptr;
-                        oesBlitter.BlitToPanel(panelMgr.PanelAt(pi), useTex, useStMat);
+                        if (pi == g_captureIdx) {
+                            std::vector<uint8_t> px;
+                            auto& cp = panelMgr.PanelAt(pi);
+                            if (oesBlitter.BlitToPanel(cp, useTex, useStMat, &px) && !px.empty())
+                                CallBridgePanelCaptured(androidApp, pi, cp.width, cp.height, px);
+                            g_captureIdx = -1;
+                        } else {
+                            oesBlitter.BlitToPanel(panelMgr.PanelAt(pi), useTex, useStMat);
+                        }
                         // v0.8-1b: blit bar OES for this panel if present
                         if (panelMgr.PanelAt(pi).barOesTexId != 0) {
                             float barStMat[16]; bool haveBar = CallGetBarSTMatrix(androidApp, (int)pi, barStMat);
