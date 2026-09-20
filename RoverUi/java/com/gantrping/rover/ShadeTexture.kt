@@ -149,7 +149,7 @@ object ShadeTexture {
         switchRow("Do not disturb", if (s.dnd) "notification pop-ups off" else "pop-ups on", s.dnd, Hit.DndToggle)
         val boundarySub = when {
             !s.boundaryOff -> "guardian active"
-            s.wakeFixRunning -> "guardian stopped, kept off after sleep"
+            s.wakeFixRunning -> "guardian stopped, reapplied after each wake"
             else -> "guardian stopped until next sleep"
         }
         switchRow("Boundary off", boundarySub, s.boundaryOff, Hit.BoundaryToggle)

@@ -8,8 +8,6 @@ import android.util.Log
 /** Quick-settings state + actions. All shell work is root and blocking: call off the UI thread. */
 object QuickSettings {
     private const val TAG = "RoverQS"
-    private const val TERMUX_HOME = "/data/data/com.termux/files/home"
-    private const val WAKE_FIX = "$TERMUX_HOME/rover_ui_wake_fix.sh"
     private const val GUARDIAN_PROC = "com.oculus.vrguardianservice"  // process of package com.oculus.guardian
 
     data class SavedNetwork(val id: Int, val ssid: String)
@@ -31,6 +29,13 @@ object QuickSettings {
     @Volatile var state = State()
         private set
 
+    /** Keep guardian dead across wakes, re-running the vrshell recovery each time. Persisted. */
+    @Volatile var keepBoundaryOff = false
+        private set
+
+    private const val PREFS = "quickSettings"
+    private const val PREF_KEEP_BOUNDARY_OFF = "keepBoundaryOff"
+
     private fun su(cmd: String): String = try {
         val p = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
         val out = p.inputStream.bufferedReader().readText()
@@ -43,9 +48,11 @@ object QuickSettings {
     private val scanRe = Regex("""^\s*[0-9a-f:]{17}\s+\d+\s+(-?\d+)\S*\s+[\d.]+\s+(.*?)\s+(\[.*)$""")
 
     fun refresh(ctx: Context) {
+        keepBoundaryOff = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(PREF_KEEP_BOUNDARY_OFF, false)
         val dnd = su("settings get global zen_mode").trim().let { it.isNotEmpty() && it != "0" }
         val procs = su("ps -A -o ARGS").lines()
-        val wakeFix = procs.any { it.contains("rover_ui_wake_fix.sh") }
+        val wakeFix = keepBoundaryOff
         val guardianUp = procs.any { it.contains(GUARDIAN_PROC) }
         val status = su("cmd wifi status")
         val enabled = status.contains("Wifi is enabled")
@@ -72,23 +79,30 @@ object QuickSettings {
     fun setDnd(on: Boolean) { su("cmd notification set_dnd ${if (on) "on" else "off"}") }
 
     /**
-     * Boundary off = guardian force-stopped, plus the wake_fix daemon that re-applies that after
-     * sleep/wake (vrshell needs guardian while it starts up). Boundary on = stop the daemon; guardian
-     * comes back when vrshell next rebinds it (headset sleep/wake), since restarting it now would
-     * mean restarting vrshell under rover.
+     * Boundary off = guardian force-stopped. vrshell cannot finish starting without guardian, so on
+     * every wake rover re-runs the recovery (guardian back, vrshell restarted with it, guardian off
+     * again) - see wakeRecovery(). Boundary on just stops killing it: the next wake leaves it up.
      */
-    fun setBoundaryOff(off: Boolean) {
-        // '[r]' keeps pkill from matching this very su shell's command line.
-        su("pkill -9 -f '[r]over_ui_wake_fix'")
-        if (off) {
-            // Run as Termux with its real HOME: the script logs to ~/rover_wake.log.
-            su("su - u0_a159 -c 'HOME=$TERMUX_HOME nohup setsid /data/data/com.termux/files/usr/bin/bash $WAKE_FIX " +
-               "</dev/null >$TERMUX_HOME/wf_stderr.log 2>&1 &'")
-            su("am force-stop com.oculus.guardian")
-        }
-        val procs = su("ps -A -o ARGS").lines()
-        Log.i(TAG, "boundary off -> $off: wake_fix=${procs.any { it.contains("rover_ui_wake_fix.sh") }} " +
-                   "guardian=${procs.any { it.contains(GUARDIAN_PROC) }}")
+    fun setBoundaryOff(ctx: Context, off: Boolean) {
+        su("pkill -9 -f '[r]over_ui_wake_fix'")  // retire the old Termux daemon if it is still around
+        keepBoundaryOff = off
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean(PREF_KEEP_BOUNDARY_OFF, off).apply()
+        if (off) su("am force-stop com.oculus.guardian") else wakeRecovery(killGuardian = false)
+        Log.i(TAG, "boundary off -> $off: guardian=${su("ps -A -o ARGS").lines().any { it.contains(GUARDIAN_PROC) }}")
+    }
+
+    /**
+     * Restart vrshell with guardian alive, then optionally stop guardian again. Without this, a
+     * headset that wakes with guardian dead shows passthrough with no vrshell panels at all.
+     * Rover's own panels and their apps survive it.
+     */
+    fun wakeRecovery(killGuardian: Boolean) {
+        Log.i(TAG, "wake recovery (killGuardian=$killGuardian)")
+        su("pm enable com.oculus.guardian; am force-stop com.oculus.vrshell; sleep 1; " +
+           "monkey -p com.oculus.vrshell 1; sleep 4" + (if (killGuardian) "; am force-stop com.oculus.guardian" else "") +
+           // a restarted vrshell puts its own overlays back up; re-fronting rover clears them
+           "; am start -n com.gantrping.rover/.RoverActivity")
     }
 
     fun setWifi(on: Boolean) { su("cmd wifi set-wifi-enabled ${if (on) "enabled" else "disabled"}") }

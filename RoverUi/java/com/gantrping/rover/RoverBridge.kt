@@ -506,7 +506,7 @@ object RoverBridge {
             ShadeTexture.Hit.None -> return
             ShadeTexture.Hit.DndToggle -> shadeExec.submit { QuickSettings.setDnd(!QuickSettings.state.dnd) }
             ShadeTexture.Hit.BoundaryToggle -> shadeExec.submit {
-                QuickSettings.setBoundaryOff(!QuickSettings.state.boundaryOff)
+                QuickSettings.setBoundaryOff(a, !QuickSettings.state.boundaryOff)
                 Thread.sleep(500)
             }
             ShadeTexture.Hit.WifiToggle -> shadeExec.submit {
@@ -748,6 +748,31 @@ object RoverBridge {
             Log.i(TAG, "recording -> $start")
         }
         showStatus(if (start) "Recording" else "Recording saved to Oculus/VideoShots")
+    }
+
+    /** Native calls this once per wake from sleep. */
+    @Volatile private var lastWakeFixMs = 0L
+    @JvmStatic
+    fun onHeadsetWake(): Int {
+        val a = activity ?: return 0
+        if (!QuickSettings.keepBoundaryOff) {
+            shadeExec.submit { QuickSettings.refresh(a); if (QuickSettings.keepBoundaryOff) wakeRecoveryNow(a) }
+            return 0
+        }
+        val now = System.currentTimeMillis()
+        if (now - lastWakeFixMs < 20_000) return 0   // one recovery per wake, not per event burst
+        lastWakeFixMs = now
+        wakeRecoveryNow(a)
+        return 0
+    }
+
+    private fun wakeRecoveryNow(a: Activity) {
+        lastWakeFixMs = System.currentTimeMillis()
+        shadeExec.submit {
+            QuickSettings.wakeRecovery(killGuardian = true)
+            QuickSettings.refresh(a)
+        }
+        showStatus("Restoring shell after wake")
     }
 
     @JvmStatic fun stopRecordingIfActive() { if (recording) toggleRecording() }

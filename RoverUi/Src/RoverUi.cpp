@@ -377,6 +377,9 @@ void App::Clear() {
     appRenderer.Clear();
 }
 
+static bool g_sessionWasStopped = false;  // headset slept; next READY is a wake
+static bool g_headsetWoke = false;        // consumed by the frame loop
+
 void App::HandleSessionStateChanges(XrSessionState state) {
     if (state == XR_SESSION_STATE_READY) {
 #if defined(XR_USE_PLATFORM_ANDROID)
@@ -529,7 +532,11 @@ void App::HandleXrEvents() {
                         Focused = false;
                         break;
                     case XR_SESSION_STATE_READY:
+                        if (g_sessionWasStopped) { g_sessionWasStopped = false; g_headsetWoke = true; }
+                        HandleSessionStateChanges(session_state_changed_event->state);
+                        break;
                     case XR_SESSION_STATE_STOPPING:
+                        g_sessionWasStopped = true;
                         HandleSessionStateChanges(session_state_changed_event->state);
                         break;
                     case XR_SESSION_STATE_EXITING:
@@ -2685,6 +2692,11 @@ int main() {
         {
             int sreq = CallBridgeInt(androidApp, "pollShadeVisRequest");
             if (sreq >= 0 && g_shadePanelIdx >= 0) panelMgr.PanelAt(g_shadePanelIdx).visible = (sreq == 1);
+            if (g_headsetWoke) {
+                g_headsetWoke = false;
+                ALOGE("[rover] headset wake - notifying Kotlin");
+                CallBridgeInt(androidApp, "onHeadsetWake");
+            }
             int creq = CallBridgeInt(androidApp, "pollPanelCaptureRequest");
             if (creq >= 0) g_captureIdx = creq;
             int treq = CallBridgeInt(androidApp, "pollToastVisRequest");
